@@ -7,7 +7,7 @@
 
 import { sendMessage, editMessage, answerCallback, checkMembership } from './tg.js';
 import { t, portfolioLabel } from './i18n.js';
-import { langKeyboard, subKeyboard, portfolioKeyboard, topKeyboard, settingsKeyboard } from './keyboards.js';
+import { langKeyboard, subKeyboard, portfolioKeyboard, topKeyboard, settingsKeyboard, dashboardsKeyboard } from './keyboards.js';
 import { runNotifications } from './notify.js';
 
 // ─── KV helpers ────────────────────────────────────────────────────────────
@@ -62,6 +62,14 @@ async function handleSettings(chatId, env) {
 
 // ─── /stop ─────────────────────────────────────────────────────────────────
 
+async function handleDashboards(chatId, env) {
+  const { BOT_TOKEN: token, BOT_KV: kv } = env;
+  const user = await getUser(kv, chatId);
+  const lang = user.lang ?? 'en';
+  const txt  = t[lang];
+  await sendMessage(token, chatId, txt.dashboards, { reply_markup: dashboardsKeyboard(txt) });
+}
+
 async function handleStop(chatId, env) {
   const { BOT_TOKEN: token, BOT_KV: kv } = env;
   const user = await getUser(kv, chatId);
@@ -78,9 +86,10 @@ async function handleMessage(update, env) {
   const chatId = msg.chat.id;
   const text   = msg.text;
 
-  if (text === '/start')    return handleStart(chatId, msg.from, env);
-  if (text === '/settings') return handleSettings(chatId, env);
-  if (text === '/stop')     return handleStop(chatId, env);
+  if (text === '/start')      return handleStart(chatId, msg.from, env);
+  if (text === '/settings')   return handleSettings(chatId, env);
+  if (text === '/stop')       return handleStop(chatId, env);
+  if (text === '/dashboards') return handleDashboards(chatId, env);
 }
 
 // ─── Callback handler ───────────────────────────────────────────────────────

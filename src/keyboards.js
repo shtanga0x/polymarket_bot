@@ -28,6 +28,13 @@ export function topKeyboard(txt) {
   ]]};
 }
 
+export function dashboardsKeyboard(txt) {
+  return { inline_keyboard: [[
+    { text: txt.btnCoreDashboard,  url: 'https://shtanga0x.github.io/polymarket_core/'  },
+    { text: txt.btnWatchDashboard, url: 'https://shtanga0x.github.io/polymarket_watch/' },
+  ]]};
+}
+
 export function settingsKeyboard(txt, active) {
   return { inline_keyboard: [
     [{ text: txt.btnChange,                               callback_data: 'change_settings' }],

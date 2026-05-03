@@ -51,10 +51,10 @@ function marketUrl(pos) {
     : `${POLYMARKET}/market/${pos.slug}${REFERRAL}`;
 }
 
-function buildMessage(pos, currentRank, prevRank, sourceLabel, lang) {
+function buildMessage(pos, currentRank, prevRank, sourceLabel, lang, topLevel) {
   const txt      = t[lang];
   const isNew    = prevRank === null;
-  const header   = isNew ? txt.newPos(sourceLabel) : txt.movedUp(sourceLabel);
+  const header   = isNew ? txt.newPos(sourceLabel, topLevel) : txt.movedUp(sourceLabel, topLevel);
   const rankLine = isNew
     ? `📍 NEW → *#${currentRank}*`
     : `📍 #${prevRank} → *#${currentRank}*`;
@@ -181,7 +181,7 @@ export async function runNotifications(env) {
       const toSend = newEntries.filter(e => e.currentRank <= topLevel);
 
       for (const { pos, currentRank, prevRank } of toSend) {
-        const msg = buildMessage(pos, currentRank, prevRank, label, lang);
+        const msg = buildMessage(pos, currentRank, prevRank, label, lang, topLevel);
         try {
           await sendMessage(token, userId, msg);
         } catch (err) {
