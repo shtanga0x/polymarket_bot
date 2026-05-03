@@ -7,7 +7,7 @@ crons = ["*/5 * * * *"]
 
 [[kv_namespaces]]
 binding = "BOT_KV"
-id = "FILL_AFTER_CREATE"
+id = "ac65f259d26749cfa735493ffa8a82e7"
 
 # Set secrets after deploy:
 #   npx wrangler secret put BOT_TOKEN
