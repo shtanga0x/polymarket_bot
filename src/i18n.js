@@ -1,0 +1,69 @@
+export const t = {
+  en: {
+    welcome: '👋 Welcome to *Polymarket Watch Bot*!\n\nChoose your language:',
+    checkSub: '📢 To use this bot, please subscribe to our channel first:',
+    noSub: '❌ You are not subscribed yet.\nPlease subscribe to @shtanga0x and tap *Check subscription*.',
+    subOk: '✅ Subscription confirmed!',
+    choosePortfolio: '📊 Which portfolio do you want to follow?',
+    chooseTop: '🔔 Get notified when a position enters:',
+    configured: (portfolio, top) =>
+      `✅ *All set!*\n\nYou will receive notifications when new positions enter *Top ${top}* of the *${portfolio}* portfolio.\n\nUse /settings to change · /stop to turn off`,
+    settings: (lang, portfolio, top, active) =>
+      `⚙️ *Your settings*\n\n🌐 Language: ${lang}\n📊 Portfolio: ${portfolio}\n🔔 Threshold: Top ${top}\n🔔 Notifications: ${active ? '✅ On' : '🔕 Off'}`,
+    stopped: '🔕 Notifications turned off.\nUse /start to re-enable.',
+    resumed: '✅ Notifications turned on!',
+    newPos: (portfolio) => `🆕 *New position · ${portfolio} Portfolio*`,
+    movedUp: (portfolio) => `📈 *Position entered Top · ${portfolio} Portfolio*`,
+    btnEn: '🇬🇧 English',
+    btnRu: '🇷🇺 Русский',
+    btnFollow: '📢 Subscribe to @shtanga0x',
+    btnCheck: '✅ Check subscription',
+    btnCore: '📊 Core',
+    btnWatch: '👁 Watch',
+    btnBoth: '📊+👁 Both',
+    btnTop5: '🏆 Top 5',
+    btnTop10: '🥇 Top 10',
+    btnTop30: '📋 Top 30',
+    btnChange: '⚙️ Change settings',
+    btnStop: '🔕 Turn off notifications',
+    btnResume: '✅ Turn on notifications',
+  },
+  ru: {
+    welcome: '👋 Добро пожаловать в *Polymarket Watch Bot*!\n\nВыберите язык:',
+    checkSub: '📢 Для использования бота подпишитесь на наш канал:',
+    noSub: '❌ Вы ещё не подписаны.\nПожалуйста, подпишитесь на @shtanga0x и нажмите *Проверить подписку*.',
+    subOk: '✅ Подписка подтверждена!',
+    choosePortfolio: '📊 За каким портфелем вы хотите следить?',
+    chooseTop: '🔔 Получать уведомления при попадании позиции в:',
+    configured: (portfolio, top) =>
+      `✅ *Готово!*\n\nВы будете получать уведомления, когда новые позиции попадают в *Топ ${top}* портфеля *${portfolio}*.\n\n/settings — изменить · /stop — отключить`,
+    settings: (lang, portfolio, top, active) =>
+      `⚙️ *Ваши настройки*\n\n🌐 Язык: ${lang}\n📊 Портфель: ${portfolio}\n🔔 Порог: Топ ${top}\n🔔 Уведомления: ${active ? '✅ Вкл' : '🔕 Выкл'}`,
+    stopped: '🔕 Уведомления отключены.\nИспользуйте /start для повторного включения.',
+    resumed: '✅ Уведомления включены!',
+    newPos: (portfolio) => `🆕 *Новая позиция · Портфель ${portfolio}*`,
+    movedUp: (portfolio) => `📈 *Позиция вошла в Топ · Портфель ${portfolio}*`,
+    btnEn: '🇬🇧 English',
+    btnRu: '🇷🇺 Русский',
+    btnFollow: '📢 Подписаться на @shtanga0x',
+    btnCheck: '✅ Проверить подписку',
+    btnCore: '📊 Core',
+    btnWatch: '👁 Watch',
+    btnBoth: '📊+👁 Оба',
+    btnTop5: '🏆 Топ 5',
+    btnTop10: '🥇 Топ 10',
+    btnTop30: '📋 Топ 30',
+    btnChange: '⚙️ Изменить настройки',
+    btnStop: '🔕 Отключить уведомления',
+    btnResume: '✅ Включить уведомления',
+  },
+};
+
+export function portfolioLabel(portfolio, lang) {
+  const map = {
+    core:  { en: 'Core',         ru: 'Core'         },
+    watch: { en: 'Watch',        ru: 'Watch'        },
+    both:  { en: 'Core + Watch', ru: 'Core + Watch' },
+  };
+  return map[portfolio]?.[lang] ?? portfolio;
+}

@@ -1,0 +1,14 @@
+{
+  "name": "polymarket-bot",
+  "version": "1.0.0",
+  "description": "Telegram notification bot for Polymarket Watch & Core dashboards",
+  "type": "module",
+  "scripts": {
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "set-webhook": "node scripts/set_webhook.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
