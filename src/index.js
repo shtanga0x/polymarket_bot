@@ -32,10 +32,15 @@ async function addToIndex(kv, chatId) {
 
 // ─── /start ────────────────────────────────────────────────────────────────
 
-async function handleStart(chatId, env) {
+async function handleStart(chatId, from, env) {
   const { BOT_TOKEN: token, BOT_KV: kv } = env;
   const user = await getUser(kv, chatId);
-  await saveUser(kv, chatId, { ...user, state: 'choosing_language' });
+  await saveUser(kv, chatId, {
+    ...user,
+    state: 'choosing_language',
+    username:   from.username   ?? null,
+    firstName:  from.first_name ?? null,
+  });
   await sendMessage(token, chatId, t.en.welcome, { reply_markup: langKeyboard(t.en) });
 }
 
@@ -73,7 +78,7 @@ async function handleMessage(update, env) {
   const chatId = msg.chat.id;
   const text   = msg.text;
 
-  if (text === '/start')    return handleStart(chatId, env);
+  if (text === '/start')    return handleStart(chatId, msg.from, env);
   if (text === '/settings') return handleSettings(chatId, env);
   if (text === '/stop')     return handleStop(chatId, env);
 }
@@ -95,7 +100,13 @@ async function handleCallback(update, env) {
   if (data === 'lang_en' || data === 'lang_ru') {
     const lang = data === 'lang_en' ? 'en' : 'ru';
     const txt  = t[lang];
-    await saveUser(kv, chatId, { ...user, lang, state: 'checking_subscription' });
+    await saveUser(kv, chatId, {
+      ...user,
+      lang,
+      state: 'checking_subscription',
+      username:  cb.from.username   ?? user.username  ?? null,
+      firstName: cb.from.first_name ?? user.firstName ?? null,
+    });
     return editMessage(token, chatId, msgId, txt.checkSub, { reply_markup: subKeyboard(txt) });
   }
 
