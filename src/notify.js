@@ -13,16 +13,20 @@ const SNAPSHOT_SIZE = 100; // track top-100 for rank-change context
 
 const SOURCES = [
   {
-    key:      'watch',
-    label:    { en: 'Watch', ru: 'Watch' },
-    dataUrl:  'https://shtanga0x.github.io/polymarket_watch/data/aggregated_portfolio.json',
-    metaUrl:  'https://shtanga0x.github.io/polymarket_watch/data/metadata.json',
+    key:     'watch',
+    label:   { en: 'Watch', ru: 'Watch' },
+    emoji:   '👁',
+    url:     'https://shtanga0x.github.io/polymarket_watch/',
+    dataUrl: 'https://shtanga0x.github.io/polymarket_watch/data/aggregated_portfolio.json',
+    metaUrl: 'https://shtanga0x.github.io/polymarket_watch/data/metadata.json',
   },
   {
-    key:      'core',
-    label:    { en: 'Core', ru: 'Core' },
-    dataUrl:  'https://shtanga0x.github.io/polymarket_core/data/aggregated_portfolio.json',
-    metaUrl:  'https://shtanga0x.github.io/polymarket_core/data/metadata.json',
+    key:     'core',
+    label:   { en: 'Core', ru: 'Core' },
+    emoji:   '📊',
+    url:     'https://shtanga0x.github.io/polymarket_core/',
+    dataUrl: 'https://shtanga0x.github.io/polymarket_core/data/aggregated_portfolio.json',
+    metaUrl: 'https://shtanga0x.github.io/polymarket_core/data/metadata.json',
   },
 ];
 
@@ -51,17 +55,22 @@ function marketUrl(pos) {
     : `${POLYMARKET}/market/${pos.slug}${REFERRAL}`;
 }
 
-function buildMessage(pos, currentRank, prevRank, sourceLabel, lang, topLevel) {
-  const txt      = t[lang];
-  const isNew    = prevRank === null;
-  const header   = isNew ? txt.newPos(sourceLabel, topLevel) : txt.movedUp(sourceLabel, topLevel);
-  const rankLine = isNew
+function buildMessage(pos, currentRank, prevRank, source, lang, topLevel, totalPortfolioExposure) {
+  const txt          = t[lang];
+  const isNew        = prevRank === null;
+  const portfolioLink = `[${source.label[lang]} Portfolio](${source.url})`;
+  const headerText   = isNew ? txt.newPos(portfolioLink, topLevel) : txt.movedUp(portfolioLink, topLevel);
+  const header       = `${source.emoji} ${headerText}`;
+  const rankLine     = isNew
     ? `📍 NEW → *#${currentRank}*`
     : `📍 #${prevRank} → *#${currentRank}*`;
 
   const outcomeIcon = pos.outcome === 'Yes' ? '🟢' : '🔴';
   const priceChange = pos.priceChangePct != null
     ? ` (${fmtPct(pos.priceChangePct)})`
+    : '';
+  const exposurePct = totalPortfolioExposure > 0
+    ? ` (${(pos.totalExposure / totalPortfolioExposure * 100).toFixed(2)}%)`
     : '';
 
   return [
@@ -70,7 +79,7 @@ function buildMessage(pos, currentRank, prevRank, sourceLabel, lang, topLevel) {
     '',
     `📌 [${pos.title}](${marketUrl(pos)})`,
     `${outcomeIcon} *${pos.outcome}* | Entry: ${fmtCents(pos.avgEntry)} → Now: ${fmtCents(pos.curPrice)}${priceChange}`,
-    `💰 Exposure: *${fmtUSD(pos.totalExposure)}*  |  👥 ${pos.traderCount} traders`,
+    `💰 Exposure: *${fmtUSD(pos.totalExposure)}${exposurePct}*  |  👥 ${pos.traderCount} traders`,
   ].join('\n');
 }
 
@@ -174,14 +183,14 @@ export async function runNotifications(env) {
       if (!user?.active) continue;
       if (user.portfolio !== source.key && user.portfolio !== 'both') continue;
 
-      const topLevel = user.topLevel ?? 10;
-      const lang     = user.lang ?? 'en';
-      const label    = source.label[lang];
+      const topLevel            = user.topLevel ?? 10;
+      const lang                = user.lang ?? 'en';
+      const totalPortfolioExposure = portfolio.summary?.totalExposure ?? 0;
 
       const toSend = newEntries.filter(e => e.currentRank <= topLevel);
 
       for (const { pos, currentRank, prevRank } of toSend) {
-        const msg = buildMessage(pos, currentRank, prevRank, label, lang, topLevel);
+        const msg = buildMessage(pos, currentRank, prevRank, source, lang, topLevel, totalPortfolioExposure);
         try {
           await sendMessage(token, userId, msg);
         } catch (err) {
