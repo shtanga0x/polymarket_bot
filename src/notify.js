@@ -40,7 +40,7 @@ function fmtUSD(v) {
 }
 
 function fmtCents(v) {
-  return Math.round(parseFloat(v) * 100) + '¢';
+  return (parseFloat(v) * 100).toFixed(1) + '¢';
 }
 
 function fmtPct(v) {
