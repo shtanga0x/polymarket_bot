@@ -49,6 +49,10 @@ function fmtPct(v) {
   return `${sign}${n.toFixed(1)}%`;
 }
 
+function escHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function marketUrl(pos) {
   return pos.eventSlug
     ? `${POLYMARKET}/event/${pos.eventSlug}${REFERRAL}`
@@ -56,14 +60,14 @@ function marketUrl(pos) {
 }
 
 function buildMessage(pos, currentRank, prevRank, source, lang, topLevel, totalPortfolioExposure) {
-  const txt          = t[lang];
-  const isNew        = prevRank === null;
-  const portfolioLink = `[${source.label[lang]} Portfolio](${source.url})`;
-  const headerText   = isNew ? txt.newPos(portfolioLink, topLevel) : txt.movedUp(portfolioLink, topLevel);
-  const header       = `${source.emoji} ${headerText}`;
-  const rankLine     = isNew
-    ? `📍 NEW → *#${currentRank}*`
-    : `📍 #${prevRank} → *#${currentRank}*`;
+  const txt           = t[lang];
+  const isNew         = prevRank === null;
+  const portfolioLink = `<a href="${source.url}">${source.label[lang]} Portfolio</a>`;
+  const headerText    = isNew ? txt.newPos(portfolioLink, topLevel) : txt.movedUp(portfolioLink, topLevel);
+  const header        = `${source.emoji} <b>${headerText}</b>`;
+  const rankLine      = isNew
+    ? `📍 NEW → <b>#${currentRank}</b>`
+    : `📍 #${prevRank} → <b>#${currentRank}</b>`;
 
   const outcomeIcon = pos.outcome === 'Yes' ? '🟢' : '🔴';
   const priceChange = pos.priceChangePct != null
@@ -77,9 +81,9 @@ function buildMessage(pos, currentRank, prevRank, source, lang, topLevel, totalP
     header,
     rankLine,
     '',
-    `📌 [${pos.title}](${marketUrl(pos)})`,
-    `${outcomeIcon} *${pos.outcome}* | Entry: ${fmtCents(pos.avgEntry)} → Now: ${fmtCents(pos.curPrice)}${priceChange}`,
-    `💰 Exposure: *${fmtUSD(pos.totalExposure)}${exposurePct}*  |  👥 ${pos.traderCount} traders`,
+    `📌 <a href="${marketUrl(pos)}">${escHtml(pos.title)}</a>`,
+    `${outcomeIcon} <b>${pos.outcome}</b> | Entry: ${fmtCents(pos.avgEntry)} → Now: ${fmtCents(pos.curPrice)}${priceChange}`,
+    `💰 Exposure: <b>${fmtUSD(pos.totalExposure)}${exposurePct}</b>  |  👥 ${pos.traderCount} traders`,
   ].join('\n');
 }
 
@@ -192,7 +196,7 @@ export async function runNotifications(env) {
       for (const { pos, currentRank, prevRank } of toSend) {
         const msg = buildMessage(pos, currentRank, prevRank, source, lang, topLevel, totalPortfolioExposure);
         try {
-          await sendMessage(token, userId, msg);
+          await sendMessage(token, userId, msg, { parse_mode: 'HTML' });
         } catch (err) {
           console.error(`Failed to notify ${userId}:`, err.message);
         }
