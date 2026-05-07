@@ -5,7 +5,6 @@
  */
 
 import { sendMessage } from './tg.js';
-import { t, portfolioLabel } from './i18n.js';
 
 const POLYMARKET    = 'https://polymarket.com';
 const REFERRAL      = '?r=shtanga';
@@ -60,14 +59,12 @@ function marketUrl(pos) {
 }
 
 function buildMessage(pos, currentRank, prevRank, source, lang, topLevel, totalPortfolioExposure) {
-  const txt           = t[lang];
   const isNew         = prevRank === null;
   const portfolioLink = `<a href="${source.url}">${source.label[lang]} Portfolio</a>`;
-  const headerText    = isNew ? txt.newPos(portfolioLink, topLevel) : txt.movedUp(portfolioLink, topLevel);
-  const header        = `${source.emoji} <b>${headerText}</b>`;
-  const rankLine      = isNew
-    ? `📍 NEW → <b>#${currentRank}</b>`
-    : `📍 #${prevRank} → <b>#${currentRank}</b>`;
+  const rankChange    = isNew
+    ? `NEW → <b>#${currentRank}</b>`
+    : `#${prevRank} → <b>#${currentRank}</b>`;
+  const header        = `${source.emoji} <b>${portfolioLink}</b> ${rankChange}`;
 
   const outcomeIcon = pos.outcome === 'Yes' ? '🟢' : '🔴';
   const priceChange = pos.priceChangePct != null
@@ -79,7 +76,6 @@ function buildMessage(pos, currentRank, prevRank, source, lang, topLevel, totalP
 
   return [
     header,
-    rankLine,
     '',
     `📌 <a href="${marketUrl(pos)}">${escHtml(pos.title)}</a>`,
     `${outcomeIcon} <b>${pos.outcome}</b> | Entry: ${fmtCents(pos.avgEntry)} → Now: ${fmtCents(pos.curPrice)}${priceChange}`,
