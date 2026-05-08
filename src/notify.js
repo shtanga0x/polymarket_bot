@@ -84,27 +84,30 @@ function buildMessage(pos, currentRank, prevRank, source, lang, topLevel, totalP
 }
 
 // ─── KV helpers ────────────────────────────────────────────────────────────
+// snapshot + lastProcessed live in one key so each cron tick does at most
+// 1 write per source (free-tier KV gives 1000 writes/day).
 
-async function getSnapshot(kv, key) {
-  const raw = await kv.get(`snapshot:${key}`);
-  return raw ? JSON.parse(raw) : [];
+async function getState(kv, key) {
+  const raw = await kv.get(`state:${key}`);
+  if (raw) return JSON.parse(raw);
+  // Legacy fallback — runs once per source after deploy, then state:* takes over.
+  const [snapRaw, lastProcessed] = await Promise.all([
+    kv.get(`snapshot:${key}`),
+    kv.get(`last_processed:${key}`),
+  ]);
+  return {
+    snapshot: snapRaw ? JSON.parse(snapRaw) : [],
+    lastProcessed: lastProcessed || null,
+  };
 }
 
-async function saveSnapshot(kv, key, positions) {
+async function saveState(kv, key, positions, lastProcessed) {
   const snapshot = positions.slice(0, SNAPSHOT_SIZE).map((p, i) => ({
     conditionId:  p.conditionId,
     outcomeIndex: p.outcomeIndex ?? (p.outcome === 'Yes' ? 1 : 0),
     rank: i + 1,
   }));
-  await kv.put(`snapshot:${key}`, JSON.stringify(snapshot));
-}
-
-async function getLastProcessed(kv, key) {
-  return kv.get(`last_processed:${key}`);
-}
-
-async function setLastProcessed(kv, key, ts) {
-  await kv.put(`last_processed:${key}`, ts);
+  await kv.put(`state:${key}`, JSON.stringify({ snapshot, lastProcessed }));
 }
 
 // ─── Portfolio fetch ────────────────────────────────────────────────────────
@@ -139,8 +142,8 @@ export async function runNotifications(env) {
     const meta = await fetchJSON(source.metaUrl);
     if (!meta?.last_updated) continue;
 
-    const lastProcessed = await getLastProcessed(kv, source.key);
-    if (lastProcessed === meta.last_updated) continue; // nothing new
+    const state = await getState(kv, source.key);
+    if (state.lastProcessed === meta.last_updated) continue; // nothing new
 
     // 2. Fetch current portfolio
     const portfolio = await fetchJSON(source.dataUrl);
@@ -149,8 +152,7 @@ export async function runNotifications(env) {
     const currentPositions = portfolio.positions; // already sorted by exposure desc
 
     // 3. Load previous snapshot
-    const snapshot  = await getSnapshot(kv, source.key);
-    const prevRanks = new Map(snapshot.map(p => [
+    const prevRanks = new Map(state.snapshot.map(p => [
       `${p.conditionId}-${p.outcomeIndex}`, p.rank
     ]));
 
@@ -169,9 +171,8 @@ export async function runNotifications(env) {
       newEntries.push({ pos, currentRank, prevRank });
     }
 
-    // 5. Save new snapshot and mark as processed
-    await saveSnapshot(kv, source.key, currentPositions);
-    await setLastProcessed(kv, source.key, meta.last_updated);
+    // 5. Save new snapshot and mark as processed (single write)
+    await saveState(kv, source.key, currentPositions, meta.last_updated);
 
     if (newEntries.length === 0) continue;
 
