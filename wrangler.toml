@@ -3,11 +3,17 @@ main = "src/index.js"
 compatibility_date = "2025-01-01"
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["* * * * *"]
 
+# User profiles + subscriber list (rare writes, free tier KV).
 [[kv_namespaces]]
 binding = "BOT_KV"
 id = "ac65f259d26749cfa735493ffa8a82e7"
+
+# Snapshot + lastProcessed per source (frequent writes — R2 is free at this volume).
+[[r2_buckets]]
+binding = "BOT_STATE"
+bucket_name = "polymarket-bot-state"
 
 # Set secrets after deploy:
 #   npx wrangler secret put BOT_TOKEN

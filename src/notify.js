@@ -83,22 +83,29 @@ function buildMessage(pos, currentRank, prevRank, source, lang, topLevel, totalP
   ].join('\n');
 }
 
-// ─── KV helpers ────────────────────────────────────────────────────────────
-// snapshot + lastProcessed live in one key so each cron tick does at most
-// 1 write per source (free-tier KV gives 1000 writes/day).
+// ─── State helpers ─────────────────────────────────────────────────────────
+// snapshot + lastProcessed live in R2 (free for our cadence). KV is read once
+// as a one-time fallback during the migration window, then R2 takes over.
 
-async function getState(kv, key) {
-  const raw = await kv.get(`state:${key}`);
-  return raw ? JSON.parse(raw) : { snapshot: [], lastProcessed: null };
+async function getState(env, key) {
+  const obj = await env.BOT_STATE.get(`state/${key}.json`);
+  if (obj) return await obj.json();
+  // Legacy fallback — runs once per source after deploy, then R2 takes over.
+  const kvRaw = await env.BOT_KV.get(`state:${key}`);
+  return kvRaw ? JSON.parse(kvRaw) : { snapshot: [], lastProcessed: null };
 }
 
-async function saveState(kv, key, positions, lastProcessed) {
+async function saveState(env, key, positions, lastProcessed) {
   const snapshot = positions.slice(0, SNAPSHOT_SIZE).map((p, i) => ({
     conditionId:  p.conditionId,
     outcomeIndex: p.outcomeIndex ?? (p.outcome === 'Yes' ? 1 : 0),
     rank: i + 1,
   }));
-  await kv.put(`state:${key}`, JSON.stringify({ snapshot, lastProcessed }));
+  await env.BOT_STATE.put(
+    `state/${key}.json`,
+    JSON.stringify({ snapshot, lastProcessed }),
+    { httpMetadata: { contentType: 'application/json' } },
+  );
 }
 
 // ─── Portfolio fetch ────────────────────────────────────────────────────────
@@ -133,7 +140,7 @@ export async function runNotifications(env) {
     const meta = await fetchJSON(source.metaUrl);
     if (!meta?.last_updated) continue;
 
-    const state = await getState(kv, source.key);
+    const state = await getState(env, source.key);
     if (state.lastProcessed === meta.last_updated) continue; // nothing new
 
     // 2. Fetch current portfolio
@@ -163,7 +170,7 @@ export async function runNotifications(env) {
     }
 
     // 5. Save new snapshot and mark as processed (single write)
-    await saveState(kv, source.key, currentPositions, meta.last_updated);
+    await saveState(env, source.key, currentPositions, meta.last_updated);
 
     if (newEntries.length === 0) continue;
 
