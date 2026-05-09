@@ -16,16 +16,16 @@ const SOURCES = [
     label:   { en: 'Watch', ru: 'Watch' },
     emoji:   '👁',
     url:     'https://shtanga0x.github.io/polymarket_watch/',
-    dataUrl: 'https://shtanga0x.github.io/polymarket_watch/data/aggregated_portfolio.json',
-    metaUrl: 'https://shtanga0x.github.io/polymarket_watch/data/metadata.json',
+    dataUrl: 'https://data.shtanga.xyz/watch/aggregated_portfolio.json',
+    metaUrl: 'https://data.shtanga.xyz/watch/metadata.json',
   },
   {
     key:     'core',
     label:   { en: 'Core', ru: 'Core' },
     emoji:   '📊',
     url:     'https://shtanga0x.github.io/polymarket_core/',
-    dataUrl: 'https://shtanga0x.github.io/polymarket_core/data/aggregated_portfolio.json',
-    metaUrl: 'https://shtanga0x.github.io/polymarket_core/data/metadata.json',
+    dataUrl: 'https://data.shtanga.xyz/core/aggregated_portfolio.json',
+    metaUrl: 'https://data.shtanga.xyz/core/metadata.json',
   },
 ];
 
