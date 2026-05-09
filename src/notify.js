@@ -89,16 +89,7 @@ function buildMessage(pos, currentRank, prevRank, source, lang, topLevel, totalP
 
 async function getState(kv, key) {
   const raw = await kv.get(`state:${key}`);
-  if (raw) return JSON.parse(raw);
-  // Legacy fallback — runs once per source after deploy, then state:* takes over.
-  const [snapRaw, lastProcessed] = await Promise.all([
-    kv.get(`snapshot:${key}`),
-    kv.get(`last_processed:${key}`),
-  ]);
-  return {
-    snapshot: snapRaw ? JSON.parse(snapRaw) : [],
-    lastProcessed: lastProcessed || null,
-  };
+  return raw ? JSON.parse(raw) : { snapshot: [], lastProcessed: null };
 }
 
 async function saveState(kv, key, positions, lastProcessed) {
