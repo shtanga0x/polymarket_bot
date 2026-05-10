@@ -1,31 +1,42 @@
 /**
  * Notification engine — runs on every cron tick.
- * Fetches fresh portfolio data, compares with stored snapshot,
- * sends Telegram messages for positions newly entering Top N.
+ *
+ * Fires three kinds of messages, all gated by an "activity gate":
+ *   • Entry / progression — when a position crosses one or more of
+ *     [30, 15, 10, 5, 4, 3, 2, 1] going up (rank decreasing).
+ *   • Exit — when a position drops below the user's topLevel.
+ *
+ * Activity gate: only fire if the position's aggregate `size` (shares) or
+ * `traderCount` changed since the last snapshot. Pure rank shuffles caused by
+ * other positions moving (or by price drift alone) do not trigger messages.
  */
 
 import { sendMessage } from './tg.js';
 
 const POLYMARKET    = 'https://polymarket.com';
 const REFERRAL      = '?r=shtanga';
-const SNAPSHOT_SIZE = 100; // track top-100 for rank-change context
+const SNAPSHOT_SIZE   = 200; // track top-200 so positions falling fast still have prevRank
+const THRESHOLDS      = [30, 15, 10, 5, 4, 3, 2, 1]; // descending — used for both entry & exit
+const MAX_MILESTONES  = 10; // cap chain length so a long-lived position can't grow snapshot unboundedly
 
 const SOURCES = [
   {
-    key:     'watch',
-    label:   { en: 'Watch', ru: 'Watch' },
-    emoji:   '👁',
-    url:     'https://watch.shtanga.xyz/',
-    dataUrl: 'https://data.shtanga.xyz/watch/aggregated_portfolio.json',
-    metaUrl: 'https://data.shtanga.xyz/watch/metadata.json',
+    key:              'watch',
+    label:            { en: 'Watch', ru: 'Watch' },
+    emoji:            '👁',
+    url:              'https://watch.shtanga.xyz/',
+    dataUrl:          'https://data.shtanga.xyz/watch/aggregated_portfolio.json',
+    metaUrl:          'https://data.shtanga.xyz/watch/metadata.json',
+    recentChangesUrl: 'https://data.shtanga.xyz/watch/recent_changes.json',
   },
   {
-    key:     'core',
-    label:   { en: 'Core', ru: 'Core' },
-    emoji:   '📊',
-    url:     'https://core.shtanga.xyz/',
-    dataUrl: 'https://data.shtanga.xyz/core/aggregated_portfolio.json',
-    metaUrl: 'https://data.shtanga.xyz/core/metadata.json',
+    key:              'core',
+    label:            { en: 'Core', ru: 'Core' },
+    emoji:            '📊',
+    url:              'https://core.shtanga.xyz/',
+    dataUrl:          'https://data.shtanga.xyz/core/aggregated_portfolio.json',
+    metaUrl:          'https://data.shtanga.xyz/core/metadata.json',
+    recentChangesUrl: 'https://data.shtanga.xyz/core/recent_changes.json',
   },
 ];
 
@@ -38,12 +49,22 @@ function fmtUSD(v) {
   return '$' + n.toFixed(2);
 }
 
+function fmtUSDSigned(v) {
+  const n = parseFloat(v) || 0;
+  const sign = n >= 0 ? '+' : '−';
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) return `${sign}$${(abs / 1_000_000).toFixed(2)}M`;
+  if (abs >= 1_000)     return `${sign}$${(abs / 1_000).toFixed(1)}K`;
+  return `${sign}$${abs.toFixed(2)}`;
+}
+
 function fmtCents(v) {
   return (parseFloat(v) * 100).toFixed(1) + '¢';
 }
 
 function fmtPct(v) {
-  const n = parseFloat(v) || 0;
+  if (v == null || isNaN(v)) return 'n/a';
+  const n = parseFloat(v);
   const sign = n >= 0 ? '+' : '';
   return `${sign}${n.toFixed(1)}%`;
 }
@@ -58,18 +79,70 @@ function marketUrl(pos) {
     : `${POLYMARKET}/market/${pos.slug}${REFERRAL}`;
 }
 
-function buildMessage(pos, currentRank, prevRank, source, lang, topLevel, totalPortfolioExposure) {
-  const isNew         = prevRank === null;
+// ─── Per-position helpers ──────────────────────────────────────────────────
+
+function posKeyOf(pos) {
+  const idx = pos.outcomeIndex ?? (pos.outcome === 'Yes' ? 1 : 0);
+  return `${pos.conditionId}-${idx}`;
+}
+
+function aggregateSize(pos) {
+  if (!Array.isArray(pos.traders)) return 0;
+  return pos.traders.reduce((s, t) => s + (parseFloat(t.size) || 0), 0);
+}
+
+function isExpired(endDate) {
+  if (!endDate) return false;
+  // endDate is "YYYY-MM-DD" — compare as date string.
+  return endDate.slice(0, 10) <= new Date().toISOString().slice(0, 10);
+}
+
+// Sum trade USD flow (BUY positive, SELL negative) per window for a specific
+// conditionId+outcomeIndex. Mirrors dashboard semantics.
+function computeWindowDeltas(changes, conditionId, outcomeIndex, totalExposure) {
+  const now = Math.floor(Date.now() / 1000);
+  const windows = { h1: now - 3600, d1: now - 24 * 3600, w1: now - 7 * 24 * 3600 };
+  const out = { h1: { usd: 0, pct: null }, d1: { usd: 0, pct: null }, w1: { usd: 0, pct: null } };
+
+  for (const c of changes) {
+    if (c.conditionId !== conditionId) continue;
+    if (c.outcomeIndex !== undefined && c.outcomeIndex !== outcomeIndex) continue;
+    const ts = c.timestamp || 0;
+    for (const w of ['h1', 'd1', 'w1']) {
+      if (ts >= windows[w]) out[w].usd += (c.delta || 0);
+    }
+  }
+  for (const w of ['h1', 'd1', 'w1']) {
+    if (totalExposure > 0) out[w].pct = (out[w].usd / totalExposure) * 100;
+  }
+  return out;
+}
+
+// Render rank chain: [35, 28, 14, 8] → "#35 → #28 → #14 → <b>#8</b>"
+// `null` at the start renders as "NEW" (position wasn't tracked before).
+// `null` at the end renders as "OUT" (position has exited the snapshot).
+function renderRankChain(milestones) {
+  if (!milestones || milestones.length === 0) return '';
+  const tok = (r, isLast) => r === null ? (isLast ? 'OUT' : 'NEW') : `#${r}`;
+  if (milestones.length === 1) return `<b>${tok(milestones[0], true)}</b>`;
+  const lastIdx = milestones.length - 1;
+  const rest = milestones.slice(0, -1).map(r => tok(r, false)).join(' → ');
+  return `${rest} → <b>${tok(milestones[lastIdx], true)}</b>`;
+}
+
+function renderTraderCount(prevTC, currentTC) {
+  if (prevTC == null || prevTC === currentTC) return `${currentTC} traders`;
+  return `${prevTC} → <b>${currentTC}</b> traders`;
+}
+
+// ─── Message builders ───────────────────────────────────────────────────────
+
+function buildEntryMessage({ pos, source, lang, milestones, prevTraderCount, totalPortfolioExposure }) {
   const portfolioLink = `<a href="${source.url}">${source.label[lang]} Portfolio</a>`;
-  const rankChange    = isNew
-    ? `NEW → <b>#${currentRank}</b>`
-    : `#${prevRank} → <b>#${currentRank}</b>`;
-  const header        = `${source.emoji} <b>${portfolioLink}</b> ${rankChange}`;
+  const header = `${source.emoji} <b>${portfolioLink}</b> ${renderRankChain(milestones)}`;
 
   const outcomeIcon = pos.outcome === 'Yes' ? '🟢' : '🔴';
-  const priceChange = pos.priceChangePct != null
-    ? ` (${fmtPct(pos.priceChangePct)})`
-    : '';
+  const priceChange = pos.priceChangePct != null ? ` (${fmtPct(pos.priceChangePct)})` : '';
   const exposurePct = totalPortfolioExposure > 0
     ? ` (${(pos.totalExposure / totalPortfolioExposure * 100).toFixed(2)}%)`
     : '';
@@ -79,13 +152,43 @@ function buildMessage(pos, currentRank, prevRank, source, lang, topLevel, totalP
     '',
     `📌 <a href="${marketUrl(pos)}">${escHtml(pos.title)}</a>`,
     `${outcomeIcon} <b>${pos.outcome}</b> | Entry: ${fmtCents(pos.avgEntry)} → Now: ${fmtCents(pos.curPrice)}${priceChange}`,
-    `💰 Exposure: <b>${fmtUSD(pos.totalExposure)}${exposurePct}</b>  |  👥 ${pos.traderCount} traders`,
+    `💰 Exposure: <b>${fmtUSD(pos.totalExposure)}${exposurePct}</b>  |  👥 ${renderTraderCount(prevTraderCount, pos.traderCount)}`,
   ].join('\n');
 }
 
+function buildExitMessage({ pos, source, lang, milestones, prevTraderCount, prevExposure, deltas, redeemed }) {
+  const portfolioLink = `<a href="${source.url}">${source.label[lang]} Portfolio</a>`;
+  const reason = redeemed
+    ? '🏁 <b>Event expired — redeemed</b>'
+    : '💸 <b>Position sold down</b>';
+  // milestones ends with `null` so renderRankChain produces "→ OUT"
+  const header = `${source.emoji} <b>${portfolioLink}</b> ${renderRankChain(milestones)}`;
+
+  const outcomeIcon = pos.outcome === 'Yes' ? '🟢' : '🔴';
+  const priceLine = redeemed
+    ? `${outcomeIcon} <b>${pos.outcome}</b> | Final: ${fmtCents(pos.curPrice)}`
+    : `${outcomeIcon} <b>${pos.outcome}</b> | Now: ${fmtCents(pos.curPrice)}`;
+
+  const exposureLine = (prevExposure != null && Math.abs(prevExposure - pos.totalExposure) > 1)
+    ? `💰 Exposure: <b>${fmtUSD(prevExposure)} → ${fmtUSD(pos.totalExposure)}</b>  |  👥 ${renderTraderCount(prevTraderCount, pos.traderCount)}`
+    : `💰 Exposure: <b>${fmtUSD(pos.totalExposure)}</b>  |  👥 ${renderTraderCount(prevTraderCount, pos.traderCount)}`;
+
+  const lines = [
+    header,
+    reason,
+    '',
+    `📌 <a href="${marketUrl(pos)}">${escHtml(pos.title)}</a>`,
+    priceLine,
+    exposureLine,
+    '',
+    `📊 1h:  ${fmtUSDSigned(deltas.h1.usd)} (${fmtPct(deltas.h1.pct)})`,
+    `📊 1d:  ${fmtUSDSigned(deltas.d1.usd)} (${fmtPct(deltas.d1.pct)})`,
+    `📊 1w:  ${fmtUSDSigned(deltas.w1.usd)} (${fmtPct(deltas.w1.pct)})`,
+  ];
+  return lines.join('\n');
+}
+
 // ─── State helpers ─────────────────────────────────────────────────────────
-// snapshot + lastProcessed live in R2 (free for our cadence). KV is read once
-// as a one-time fallback during the migration window, then R2 takes over.
 
 async function getState(env, key) {
   const obj = await env.BOT_STATE.get(`state/${key}.json`);
@@ -95,20 +198,15 @@ async function getState(env, key) {
   return kvRaw ? JSON.parse(kvRaw) : { snapshot: [], lastProcessed: null };
 }
 
-async function saveState(env, key, positions, lastProcessed) {
-  const snapshot = positions.slice(0, SNAPSHOT_SIZE).map((p, i) => ({
-    conditionId:  p.conditionId,
-    outcomeIndex: p.outcomeIndex ?? (p.outcome === 'Yes' ? 1 : 0),
-    rank: i + 1,
-  }));
+async function saveState(env, key, snapshotEntries, lastProcessed) {
   await env.BOT_STATE.put(
     `state/${key}.json`,
-    JSON.stringify({ snapshot, lastProcessed }),
+    JSON.stringify({ snapshot: snapshotEntries, lastProcessed }),
     { httpMetadata: { contentType: 'application/json' } },
   );
 }
 
-// ─── Portfolio fetch ────────────────────────────────────────────────────────
+// ─── HTTP helpers ──────────────────────────────────────────────────────────
 
 async function fetchJSON(url) {
   try {
@@ -117,8 +215,6 @@ async function fetchJSON(url) {
     return res.json();
   } catch { return null; }
 }
-
-// ─── Subscriber fetch ───────────────────────────────────────────────────────
 
 async function getSubscribers(kv) {
   const raw = await kv.get('users_index');
@@ -130,74 +226,269 @@ async function getUser(kv, chatId) {
   return raw ? JSON.parse(raw) : null;
 }
 
-// ─── Main notification runner ────────────────────────────────────────────────
+// ─── Main notification runner ──────────────────────────────────────────────
 
 export async function runNotifications(env) {
   const { BOT_TOKEN: token, BOT_KV: kv } = env;
 
   for (const source of SOURCES) {
-    // 1. Check if data was updated since last run
+    // 1. Check freshness
     const meta = await fetchJSON(source.metaUrl);
     if (!meta?.last_updated) continue;
 
     const state = await getState(env, source.key);
-    if (state.lastProcessed === meta.last_updated) continue; // nothing new
+    if (state.lastProcessed === meta.last_updated) continue;
 
-    // 2. Fetch current portfolio
-    const portfolio = await fetchJSON(source.dataUrl);
+    // 2. Fetch portfolio + recent_changes in parallel
+    const [portfolio, recentChanges] = await Promise.all([
+      fetchJSON(source.dataUrl),
+      fetchJSON(source.recentChangesUrl),
+    ]);
     if (!portfolio?.positions?.length) continue;
 
-    const currentPositions = portfolio.positions; // already sorted by exposure desc
+    const allPositions = portfolio.positions; // sorted by exposure desc
+    const totalPortfolioExposure = portfolio.summary?.totalExposure ?? 0;
+    const changes = recentChanges?.changes ?? [];
 
-    // 3. Load previous snapshot
-    const prevRanks = new Map(state.snapshot.map(p => [
-      `${p.conditionId}-${p.outcomeIndex}`, p.rank
-    ]));
-
-    // 4. Find positions that newly entered top-30
-    const newEntries = [];
-    for (let i = 0; i < Math.min(30, currentPositions.length); i++) {
-      const pos          = currentPositions[i];
-      const outcomeIdx   = pos.outcomeIndex ?? (pos.outcome === 'Yes' ? 1 : 0);
-      const posKey       = `${pos.conditionId}-${outcomeIdx}`;
-      const currentRank  = i + 1;
-      const prevRank     = prevRanks.get(posKey) ?? null;
-
-      // Already in top-30 before → no notification
-      if (prevRank !== null && prevRank <= 30) continue;
-
-      newEntries.push({ pos, currentRank, prevRank });
+    // 3. Index prev snapshot by posKey
+    const prevByKey = new Map();
+    for (const p of state.snapshot) {
+      prevByKey.set(`${p.conditionId}-${p.outcomeIndex}`, p);
     }
 
-    // 5. Save new snapshot and mark as processed (single write)
-    await saveState(env, source.key, currentPositions, meta.last_updated);
+    // 4. First-run safety: if snapshot is empty OR has the legacy schema
+    // (no `size` field), save the new-schema snapshot without firing notifications.
+    // Otherwise the schema migration would trigger spurious activity-gate hits.
+    const isFirstRun = state.snapshot.length === 0
+      || state.snapshot[0]?.size === undefined;
 
-    if (newEntries.length === 0) continue;
+    // 5. Build current top-N entries with derived fields
+    const topN = allPositions.slice(0, SNAPSHOT_SIZE);
+    const currentByKey = new Map();
+    topN.forEach((pos, i) => {
+      const idx  = pos.outcomeIndex ?? (pos.outcome === 'Yes' ? 1 : 0);
+      const key  = `${pos.conditionId}-${idx}`;
+      currentByKey.set(key, {
+        pos,
+        outcomeIndex: idx,
+        rank:         i + 1,
+        size:         aggregateSize(pos),
+        traderCount:  pos.traderCount ?? (pos.traders?.length ?? 0),
+      });
+    });
 
-    // 6. Notify subscribers
+    // 6. Compute notifications. Two sources of events:
+    //    (a) positions in current top-200 — possible entry/progression OR partial drop
+    //    (b) positions in prev snapshot but not in current top-200 — drop-out events
+    const entryEvents = []; // { pos, key, prev, current, milestones, upCrossed }
+    const exitEvents  = []; // { pos, key, prev, current, milestones, downCrossed, deltas, redeemed }
+
+    // Pass A: current top-200
+    for (const [key, current] of currentByKey) {
+      const prev = prevByKey.get(key);
+      const prevRank        = prev?.rank ?? null;       // null = wasn't in prev top-200
+      const prevSize        = prev?.size ?? null;
+      const prevTraderCount = prev?.traderCount ?? null;
+      const prevExposure    = prev?.exposure ?? null;
+      const prevMilestones  = prev?.milestones ?? [];
+
+      // Activity gate: size or traderCount must have changed.
+      // For brand-new positions in snapshot, treat as "active" (real entry).
+      const sizeChanged = prev != null
+        ? (Math.abs(current.size - prevSize) > 0.001 || current.traderCount !== prevTraderCount)
+        : true;
+
+      // Threshold transitions
+      const upCrossed = THRESHOLDS.filter(T =>
+        (prevRank == null || prevRank > T) && current.rank <= T
+      );
+      const downCrossed = THRESHOLDS.filter(T =>
+        prevRank != null && prevRank <= T && current.rank > T
+      );
+
+      // Entry / progression: any up-crosses (gated by activity)
+      if (upCrossed.length && sizeChanged) {
+        // Fresh start when: never tracked, was outside top-30, or chain was reset
+        // by a recent exit (prevMilestones empty).
+        const startsFresh = prevRank == null || prevRank > 30 || prevMilestones.length === 0;
+        let milestones = startsFresh
+          ? [prevRank /* may be null → renders as "NEW" */, current.rank]
+          : [...prevMilestones, current.rank];
+        // Cap chain length: keep first entry (origin) + last (MAX_MILESTONES-1) entries
+        if (milestones.length > MAX_MILESTONES) {
+          milestones = [milestones[0], ...milestones.slice(-(MAX_MILESTONES - 1))];
+        }
+        entryEvents.push({ key, current, prev, milestones, upCrossed });
+        // Stamp milestones on the current snapshot entry
+        current.nextMilestones = milestones;
+      } else {
+        // Carry milestones forward unchanged
+        current.nextMilestones = startsFreshIfNeeded(prevMilestones, prevRank, current.rank);
+      }
+
+      // Exit (partial drop within top-200): activity required
+      if (downCrossed.length && sizeChanged) {
+        const deltas = computeWindowDeltas(changes, current.pos.conditionId, current.outcomeIndex, current.pos.totalExposure);
+        const redeemed = isExpired(current.pos.endDate);
+        // Build exit chain — append "OUT marker"
+        const baseChain = (prevMilestones.length > 0)
+          ? prevMilestones
+          : (prevRank != null ? [prevRank] : []);
+        const exitMilestones = [...baseChain, null /* renders as OUT */];
+        exitEvents.push({
+          key, current, prev,
+          milestones: exitMilestones,
+          downCrossed, deltas, redeemed,
+          prevExposure,
+        });
+        // After exit, reset milestones for re-entry
+        current.nextMilestones = [];
+      }
+    }
+
+    // Pass B: positions in prev snapshot but not in current top-200 (full drop-out)
+    for (const [key, prev] of prevByKey) {
+      if (currentByKey.has(key)) continue;
+
+      // Look up the position in full portfolio (may exist beyond top-200 with smaller exposure)
+      const fullPos = allPositions.find(p => posKeyOf(p) === key);
+      const prevRank = prev.rank;
+
+      // Down-crossed thresholds = all thresholds where prev rank was inside
+      const downCrossed = THRESHOLDS.filter(T => prevRank <= T);
+      if (downCrossed.length === 0) continue; // wasn't in any threshold; nothing to fire
+
+      // Activity gate. If position vanished from portfolio entirely → assume redemption / full sell (activity).
+      // If still present but past top-200 — compare size to prev.size.
+      let sizeChanged;
+      let displayPos;
+      let redeemed;
+      if (fullPos) {
+        const curSize = aggregateSize(fullPos);
+        const curTC   = fullPos.traderCount ?? (fullPos.traders?.length ?? 0);
+        sizeChanged = Math.abs(curSize - (prev.size ?? 0)) > 0.001 || curTC !== (prev.traderCount ?? 0);
+        displayPos = fullPos;
+        redeemed = isExpired(fullPos.endDate);
+      } else {
+        // Disappeared → infer redemption if we know endDate, else treat as fully sold.
+        sizeChanged = true; // disappearance is itself activity
+        displayPos = prev.lastPos || null;
+        redeemed = prev.endDate ? isExpired(prev.endDate) : false;
+      }
+      if (!sizeChanged) continue;
+      if (!displayPos) continue; // can't render without position metadata
+
+      const deltas = computeWindowDeltas(
+        changes,
+        displayPos.conditionId,
+        displayPos.outcomeIndex ?? (displayPos.outcome === 'Yes' ? 1 : 0),
+        displayPos.totalExposure ?? prev.exposure ?? 0,
+      );
+
+      const baseChain = (prev.milestones && prev.milestones.length > 0)
+        ? prev.milestones
+        : [prevRank];
+      const exitMilestones = [...baseChain, null];
+
+      exitEvents.push({
+        key,
+        current: { pos: displayPos, rank: null, traderCount: displayPos.traderCount ?? 0 },
+        prev,
+        milestones: exitMilestones,
+        downCrossed,
+        deltas,
+        redeemed,
+        prevExposure: prev.exposure ?? null,
+      });
+    }
+
+    // 7. Build new snapshot (from current top-200 + carry-forward of milestones)
+    const newSnapshot = [];
+    for (const [key, current] of currentByKey) {
+      newSnapshot.push({
+        conditionId:  current.pos.conditionId,
+        outcomeIndex: current.outcomeIndex,
+        rank:         current.rank,
+        size:         current.size,
+        traderCount:  current.traderCount,
+        exposure:     current.pos.totalExposure,
+        milestones:   current.nextMilestones || [],
+        // Cache the position payload so a subsequent disappearance can still render a message.
+        lastPos: {
+          title:        current.pos.title,
+          slug:         current.pos.slug,
+          eventSlug:    current.pos.eventSlug,
+          outcome:      current.pos.outcome,
+          outcomeIndex: current.outcomeIndex,
+          curPrice:     current.pos.curPrice,
+          conditionId:  current.pos.conditionId,
+          totalExposure: current.pos.totalExposure,
+          endDate:      current.pos.endDate,
+          traderCount:  current.traderCount,
+        },
+        endDate: current.pos.endDate,
+      });
+    }
+
+    // 8. Save snapshot first (idempotent — even if sending fails, we won't double-fire)
+    await saveState(env, source.key, newSnapshot, meta.last_updated);
+
+    // 9. Suppress notifications on first run after fresh deploy
+    if (isFirstRun) continue;
+    if (entryEvents.length === 0 && exitEvents.length === 0) continue;
+
+    // 10. Notify subscribers
     const userIds = await getSubscribers(kv);
-
     for (const userId of userIds) {
       const user = await getUser(kv, userId);
       if (!user?.active) continue;
       if (user.portfolio !== source.key && user.portfolio !== 'both') continue;
 
-      const topLevel            = user.topLevel ?? 10;
-      const lang                = user.lang ?? 'en';
-      const totalPortfolioExposure = portfolio.summary?.totalExposure ?? 0;
+      const topLevel = user.topLevel ?? 10;
+      const lang     = user.lang ?? 'en';
 
-      const toSend = newEntries.filter(e => e.currentRank <= topLevel);
+      // Entry/progression: send if any up-crossed threshold is ≤ topLevel
+      for (const ev of entryEvents) {
+        if (!ev.upCrossed.some(T => T <= topLevel)) continue;
+        const msg = buildEntryMessage({
+          pos: ev.current.pos,
+          source, lang,
+          milestones: ev.milestones,
+          prevTraderCount: ev.prev?.traderCount ?? null,
+          totalPortfolioExposure,
+        });
+        try { await sendMessage(token, userId, msg, { parse_mode: 'HTML' }); }
+        catch (err) { console.error(`Failed to notify ${userId}:`, err.message); }
+        await new Promise(r => setTimeout(r, 50));
+      }
 
-      for (const { pos, currentRank, prevRank } of toSend) {
-        const msg = buildMessage(pos, currentRank, prevRank, source, lang, topLevel, totalPortfolioExposure);
-        try {
-          await sendMessage(token, userId, msg, { parse_mode: 'HTML' });
-        } catch (err) {
-          console.error(`Failed to notify ${userId}:`, err.message);
-        }
-        // Respect Telegram's 30 msg/sec limit
+      // Exit: send if topLevel is among the down-crossed thresholds
+      // (i.e., this user's view of the position transitioned from "in" to "out").
+      for (const ev of exitEvents) {
+        if (!ev.downCrossed.includes(topLevel)) continue;
+        const msg = buildExitMessage({
+          pos: ev.current.pos,
+          source, lang,
+          milestones: ev.milestones,
+          prevTraderCount: ev.prev?.traderCount ?? null,
+          prevExposure: ev.prevExposure,
+          deltas: ev.deltas,
+          redeemed: ev.redeemed,
+        });
+        try { await sendMessage(token, userId, msg, { parse_mode: 'HTML' }); }
+        catch (err) { console.error(`Failed to notify ${userId}:`, err.message); }
         await new Promise(r => setTimeout(r, 50));
       }
     }
   }
+}
+
+// Carry-forward helper: when no notification fires, decide what milestones the
+// snapshot should keep. If the position is currently in top-30 and was already
+// being tracked, keep its chain. If it's outside top-30 entirely, drop the chain
+// (a future re-entry will start fresh).
+function startsFreshIfNeeded(prevMilestones, prevRank, currentRank) {
+  if (currentRank > 30) return [];
+  if (prevRank == null || prevRank > 30) return []; // never had a chain
+  return prevMilestones || [];
 }
