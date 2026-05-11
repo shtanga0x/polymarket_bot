@@ -113,9 +113,23 @@ function computeWindowDeltas(changes, conditionId, outcomeIndex, totalExposure) 
     }
   }
   for (const w of ['h1', 'd1', 'w1']) {
-    if (totalExposure > 0) out[w].pct = (out[w].usd / totalExposure) * 100;
+    // Denominator = pre-window exposure ≈ current − delta.
+    // For sells, this bounds |pct| to 100% (-100% = fully closed).
+    const denom = totalExposure - out[w].usd;
+    if (denom > 0) out[w].pct = (out[w].usd / denom) * 100;
   }
   return out;
+}
+
+// Build exit chain: [prevRank, ...thresholds crossed going down (ascending), null].
+// Mirrors entry — shows each tracked threshold the position passed through on
+// the way out. `null` at the end renders as "OUT".
+function buildExitChain(prevRank, downCrossed) {
+  if (prevRank == null) return [null];
+  const intermediates = [...downCrossed]
+    .filter(T => T > prevRank) // skip thresholds == prevRank (e.g. #30 crossing 30)
+    .sort((a, b) => a - b);
+  return [prevRank, ...intermediates, null];
 }
 
 // Render rank chain: [35, 28, 14, 8] → "#35 → #28 → #14 → <b>#8</b>"
@@ -330,11 +344,8 @@ export async function runNotifications(env) {
       if (downCrossed.length && sizeChanged) {
         const deltas = computeWindowDeltas(changes, current.pos.conditionId, current.outcomeIndex, current.pos.totalExposure);
         const redeemed = isExpired(current.pos.endDate);
-        // Build exit chain — append "OUT marker"
-        const baseChain = (prevMilestones.length > 0)
-          ? prevMilestones
-          : (prevRank != null ? [prevRank] : []);
-        const exitMilestones = [...baseChain, null /* renders as OUT */];
+        // Exit chain shows downward threshold crossings, symmetric to entry.
+        const exitMilestones = buildExitChain(prevRank, downCrossed);
         exitEvents.push({
           key, current, prev,
           milestones: exitMilestones,
@@ -378,17 +389,17 @@ export async function runNotifications(env) {
       if (!sizeChanged) continue;
       if (!displayPos) continue; // can't render without position metadata
 
+      // For disappeared positions, current exposure is effectively 0 (no remaining
+      // position) — pass 0 so % normalizes to -100% on a full sell/redemption.
+      const currentExposureForDelta = fullPos ? (fullPos.totalExposure ?? 0) : 0;
       const deltas = computeWindowDeltas(
         changes,
         displayPos.conditionId,
         displayPos.outcomeIndex ?? (displayPos.outcome === 'Yes' ? 1 : 0),
-        displayPos.totalExposure ?? prev.exposure ?? 0,
+        currentExposureForDelta,
       );
 
-      const baseChain = (prev.milestones && prev.milestones.length > 0)
-        ? prev.milestones
-        : [prevRank];
-      const exitMilestones = [...baseChain, null];
+      const exitMilestones = buildExitChain(prevRank, downCrossed);
 
       exitEvents.push({
         key,
