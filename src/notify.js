@@ -170,7 +170,7 @@ function buildEntryMessage({ pos, source, lang, milestones, prevTraderCount, tot
   ].join('\n');
 }
 
-function buildExitMessage({ pos, source, lang, milestones, prevTraderCount, prevExposure, deltas, redeemed }) {
+function buildExitMessage({ pos, source, lang, milestones, prevTraderCount, deltas, redeemed, totalPortfolioExposure }) {
   const portfolioLink = `<a href="${source.url}">${source.label[lang]} Portfolio</a>`;
   const reason = redeemed
     ? '🏁 <b>Event expired — redeemed</b>'
@@ -183,9 +183,10 @@ function buildExitMessage({ pos, source, lang, milestones, prevTraderCount, prev
     ? `${outcomeIcon} <b>${pos.outcome}</b> | Final: ${fmtCents(pos.curPrice)}`
     : `${outcomeIcon} <b>${pos.outcome}</b> | Now: ${fmtCents(pos.curPrice)}`;
 
-  const exposureLine = (prevExposure != null && Math.abs(prevExposure - pos.totalExposure) > 1)
-    ? `💰 Exposure: <b>${fmtUSD(prevExposure)} → ${fmtUSD(pos.totalExposure)}</b>  |  👥 ${renderTraderCount(prevTraderCount, pos.traderCount)}`
-    : `💰 Exposure: <b>${fmtUSD(pos.totalExposure)}</b>  |  👥 ${renderTraderCount(prevTraderCount, pos.traderCount)}`;
+  const exposurePct = totalPortfolioExposure > 0
+    ? ` (${(pos.totalExposure / totalPortfolioExposure * 100).toFixed(2)}%)`
+    : '';
+  const exposureLine = `💰 Exposure: <b>${fmtUSD(pos.totalExposure)}${exposurePct}</b>  |  👥 ${renderTraderCount(prevTraderCount, pos.traderCount)}`;
 
   const lines = [
     header,
@@ -303,7 +304,6 @@ export async function runNotifications(env) {
       const prevRank        = prev?.rank ?? null;       // null = wasn't in prev top-200
       const prevSize        = prev?.size ?? null;
       const prevTraderCount = prev?.traderCount ?? null;
-      const prevExposure    = prev?.exposure ?? null;
       const prevMilestones  = prev?.milestones ?? [];
 
       // Activity gate: size or traderCount must have changed.
@@ -350,7 +350,6 @@ export async function runNotifications(env) {
           key, current, prev,
           milestones: exitMilestones,
           downCrossed, deltas, redeemed,
-          prevExposure,
         });
         // After exit, reset milestones for re-entry
         current.nextMilestones = [];
@@ -409,7 +408,6 @@ export async function runNotifications(env) {
         downCrossed,
         deltas,
         redeemed,
-        prevExposure: prev.exposure ?? null,
       });
     }
 
@@ -482,9 +480,9 @@ export async function runNotifications(env) {
           source, lang,
           milestones: ev.milestones,
           prevTraderCount: ev.prev?.traderCount ?? null,
-          prevExposure: ev.prevExposure,
           deltas: ev.deltas,
           redeemed: ev.redeemed,
+          totalPortfolioExposure,
         });
         try { await sendMessage(token, userId, msg, { parse_mode: 'HTML' }); }
         catch (err) { console.error(`Failed to notify ${userId}:`, err.message); }
