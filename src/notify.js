@@ -14,7 +14,7 @@
 import { sendMessage } from './tg.js';
 
 const POLYMARKET    = 'https://polymarket.com';
-const REFERRAL      = '?r=shtanga';
+const REFERRAL      = '?via=shtanga';
 const SNAPSHOT_SIZE   = 200; // track top-200 so positions falling fast still have prevRank
 const THRESHOLDS      = [30, 15, 10, 5, 4, 3, 2, 1]; // descending — used for both entry & exit
 const MAX_MILESTONES  = 10; // cap chain length so a long-lived position can't grow snapshot unboundedly
