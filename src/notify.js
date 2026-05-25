@@ -231,20 +231,48 @@ async function fetchJSON(url) {
   } catch { return null; }
 }
 
-async function getSubscribers(kv) {
-  const raw = await kv.get('users_index');
-  return raw ? JSON.parse(raw) : [];
+async function getR2Json(bucket, key) {
+  const obj = await bucket.get(key);
+  return obj ? obj.json() : null;
 }
 
-async function getUser(kv, chatId) {
-  const raw = await kv.get(`user:${chatId}`);
-  return raw ? JSON.parse(raw) : null;
+async function putR2Json(bucket, key, data) {
+  await bucket.put(
+    key,
+    JSON.stringify(data),
+    { httpMetadata: { contentType: 'application/json' } },
+  );
+}
+
+async function getSubscribers(env) {
+  const ids = await getR2Json(env.BOT_STATE, 'users/index.json');
+  if (Array.isArray(ids)) return ids;
+
+  const raw = await env.BOT_KV.get('users_index');
+  if (!raw) return [];
+
+  const legacyIds = JSON.parse(raw);
+  await putR2Json(env.BOT_STATE, 'users/index.json', legacyIds);
+  return legacyIds;
+}
+
+async function getUser(env, chatId) {
+  const key = `users/user:${chatId}.json`;
+  const user = await getR2Json(env.BOT_STATE, key);
+  if (user) return user;
+
+  const raw = await env.BOT_KV.get(`user:${chatId}`);
+  if (!raw) return null;
+
+  const legacyUser = JSON.parse(raw);
+  await putR2Json(env.BOT_STATE, key, legacyUser);
+  return legacyUser;
 }
 
 // ─── Main notification runner ──────────────────────────────────────────────
 
 export async function runNotifications(env) {
-  const { BOT_TOKEN: token, BOT_KV: kv } = env;
+  const { BOT_TOKEN: token } = env;
 
   for (const source of SOURCES) {
     // 1. Check freshness
@@ -447,9 +475,9 @@ export async function runNotifications(env) {
     if (entryEvents.length === 0 && exitEvents.length === 0) continue;
 
     // 10. Notify subscribers
-    const userIds = await getSubscribers(kv);
+    const userIds = await getSubscribers(env);
     for (const userId of userIds) {
-      const user = await getUser(kv, userId);
+      const user = await getUser(env, userId);
       if (!user?.active) continue;
       if (user.portfolio !== source.key && user.portfolio !== 'both') continue;
 

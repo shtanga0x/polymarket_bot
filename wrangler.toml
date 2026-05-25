@@ -5,12 +5,13 @@ compatibility_date = "2025-01-01"
 [triggers]
 crons = ["* * * * *"]
 
-# User profiles + subscriber list (rare writes, free tier KV).
+# Legacy user profiles + subscriber list. Read-only fallback after R2 migration;
+# current code does not write to Workers KV.
 [[kv_namespaces]]
 binding = "BOT_KV"
 id = "ac65f259d26749cfa735493ffa8a82e7"
 
-# Snapshot + lastProcessed per source (frequent writes — R2 is free at this volume).
+# Snapshot, lastProcessed, user profiles, and subscriber index.
 [[r2_buckets]]
 binding = "BOT_STATE"
 bucket_name = "polymarket-bot-state"

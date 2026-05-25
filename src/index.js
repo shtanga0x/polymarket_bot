@@ -10,32 +10,64 @@ import { t, portfolioLabel } from './i18n.js';
 import { langKeyboard, subKeyboard, portfolioKeyboard, topKeyboard, settingsKeyboard, dashboardsKeyboard } from './keyboards.js';
 import { runNotifications } from './notify.js';
 
-// ─── KV helpers ────────────────────────────────────────────────────────────
+// ─── State helpers ─────────────────────────────────────────────────────────
 
-async function getUser(kv, chatId) {
-  const raw = await kv.get(`user:${chatId}`);
-  return raw ? JSON.parse(raw) : {};
+async function getR2Json(bucket, key) {
+  const obj = await bucket.get(key);
+  return obj ? obj.json() : null;
 }
 
-async function saveUser(kv, chatId, data) {
-  await kv.put(`user:${chatId}`, JSON.stringify(data));
+async function putR2Json(bucket, key, data) {
+  await bucket.put(
+    key,
+    JSON.stringify(data),
+    { httpMetadata: { contentType: 'application/json' } },
+  );
 }
 
-async function addToIndex(kv, chatId) {
-  const raw = await kv.get('users_index');
-  const ids = raw ? JSON.parse(raw) : [];
+async function getUser(env, chatId) {
+  const key = `users/user:${chatId}.json`;
+  const user = await getR2Json(env.BOT_STATE, key);
+  if (user) return user;
+
+  const raw = await env.BOT_KV.get(`user:${chatId}`);
+  if (!raw) return {};
+
+  const legacyUser = JSON.parse(raw);
+  await putR2Json(env.BOT_STATE, key, legacyUser);
+  return legacyUser;
+}
+
+async function saveUser(env, chatId, data) {
+  await putR2Json(env.BOT_STATE, `users/user:${chatId}.json`, data);
+}
+
+async function getUserIndex(env) {
+  const ids = await getR2Json(env.BOT_STATE, 'users/index.json');
+  if (Array.isArray(ids)) return ids;
+
+  const raw = await env.BOT_KV.get('users_index');
+  if (!raw) return [];
+
+  const legacyIds = JSON.parse(raw);
+  await putR2Json(env.BOT_STATE, 'users/index.json', legacyIds);
+  return legacyIds;
+}
+
+async function addToIndex(env, chatId) {
+  const ids = await getUserIndex(env);
   if (!ids.includes(chatId)) {
     ids.push(chatId);
-    await kv.put('users_index', JSON.stringify(ids));
+    await putR2Json(env.BOT_STATE, 'users/index.json', ids);
   }
 }
 
 // ─── /start ────────────────────────────────────────────────────────────────
 
 async function handleStart(chatId, from, env) {
-  const { BOT_TOKEN: token, BOT_KV: kv } = env;
-  const user = await getUser(kv, chatId);
-  await saveUser(kv, chatId, {
+  const { BOT_TOKEN: token } = env;
+  const user = await getUser(env, chatId);
+  await saveUser(env, chatId, {
     ...user,
     state: 'choosing_language',
     username:   from.username   ?? null,
@@ -47,8 +79,8 @@ async function handleStart(chatId, from, env) {
 // ─── /settings ─────────────────────────────────────────────────────────────
 
 async function handleSettings(chatId, env) {
-  const { BOT_TOKEN: token, BOT_KV: kv } = env;
-  const user = await getUser(kv, chatId);
+  const { BOT_TOKEN: token } = env;
+  const user = await getUser(env, chatId);
   const lang = user.lang ?? 'en';
   const txt  = t[lang];
   const msg  = txt.settings(
@@ -63,18 +95,18 @@ async function handleSettings(chatId, env) {
 // ─── /stop ─────────────────────────────────────────────────────────────────
 
 async function handleDashboards(chatId, env) {
-  const { BOT_TOKEN: token, BOT_KV: kv } = env;
-  const user = await getUser(kv, chatId);
+  const { BOT_TOKEN: token } = env;
+  const user = await getUser(env, chatId);
   const lang = user.lang ?? 'en';
   const txt  = t[lang];
   await sendMessage(token, chatId, txt.dashboards, { reply_markup: dashboardsKeyboard(txt) });
 }
 
 async function handleStop(chatId, env) {
-  const { BOT_TOKEN: token, BOT_KV: kv } = env;
-  const user = await getUser(kv, chatId);
+  const { BOT_TOKEN: token } = env;
+  const user = await getUser(env, chatId);
   const lang = user.lang ?? 'en';
-  await saveUser(kv, chatId, { ...user, active: false });
+  await saveUser(env, chatId, { ...user, active: false });
   await sendMessage(token, chatId, t[lang].stopped);
 }
 
@@ -95,7 +127,7 @@ async function handleMessage(update, env) {
 // ─── Callback handler ───────────────────────────────────────────────────────
 
 async function handleCallback(update, env) {
-  const { BOT_TOKEN: token, BOT_KV: kv, CHANNEL_ID } = env;
+  const { BOT_TOKEN: token, CHANNEL_ID } = env;
   const cb     = update.callback_query;
   const chatId = cb.message.chat.id;
   const msgId  = cb.message.message_id;
@@ -103,13 +135,13 @@ async function handleCallback(update, env) {
 
   await answerCallback(token, cb.id);
 
-  const user = await getUser(kv, chatId);
+  const user = await getUser(env, chatId);
 
   // ── Language choice ──────────────────────────────────────────────────────
   if (data === 'lang_en' || data === 'lang_ru') {
     const lang = data === 'lang_en' ? 'en' : 'ru';
     const txt  = t[lang];
-    await saveUser(kv, chatId, {
+    await saveUser(env, chatId, {
       ...user,
       lang,
       state: 'checking_subscription',
@@ -128,7 +160,7 @@ async function handleCallback(update, env) {
     if (!ok) {
       return sendMessage(token, chatId, txt.noSub, { reply_markup: subKeyboard(txt) });
     }
-    await saveUser(kv, chatId, { ...user, state: 'choosing_portfolio' });
+    await saveUser(env, chatId, { ...user, state: 'choosing_portfolio' });
     await editMessage(token, chatId, msgId, txt.subOk);
     return sendMessage(token, chatId, txt.choosePortfolio, { reply_markup: portfolioKeyboard(txt) });
   }
@@ -136,32 +168,32 @@ async function handleCallback(update, env) {
   // ── Portfolio choice ─────────────────────────────────────────────────────
   if (data.startsWith('port_')) {
     const portfolio = data.slice(5); // 'core' | 'watch' | 'both'
-    await saveUser(kv, chatId, { ...user, portfolio, state: 'choosing_top' });
+    await saveUser(env, chatId, { ...user, portfolio, state: 'choosing_top' });
     return editMessage(token, chatId, msgId, txt.chooseTop, { reply_markup: topKeyboard(txt) });
   }
 
   // ── Top-level choice ─────────────────────────────────────────────────────
   if (data.startsWith('top_')) {
     const topLevel = parseInt(data.slice(4));
-    await saveUser(kv, chatId, { ...user, topLevel, active: true, state: 'active' });
-    await addToIndex(kv, chatId);
+    await saveUser(env, chatId, { ...user, topLevel, active: true, state: 'active' });
+    await addToIndex(env, chatId);
     const label = portfolioLabel(user.portfolio ?? 'both', lang);
     return editMessage(token, chatId, msgId, txt.configured(label, topLevel));
   }
 
   // ── Settings actions ─────────────────────────────────────────────────────
   if (data === 'change_settings') {
-    await saveUser(kv, chatId, { ...user, state: 'choosing_portfolio' });
+    await saveUser(env, chatId, { ...user, state: 'choosing_portfolio' });
     return editMessage(token, chatId, msgId, txt.choosePortfolio, { reply_markup: portfolioKeyboard(txt) });
   }
 
   if (data === 'toggle_off') {
-    await saveUser(kv, chatId, { ...user, active: false });
+    await saveUser(env, chatId, { ...user, active: false });
     return editMessage(token, chatId, msgId, txt.stopped);
   }
 
   if (data === 'toggle_on') {
-    await saveUser(kv, chatId, { ...user, active: true });
+    await saveUser(env, chatId, { ...user, active: true });
     return editMessage(token, chatId, msgId, txt.resumed);
   }
 }
