@@ -97,6 +97,42 @@ function isExpired(endDate) {
   return endDate.slice(0, 10) <= new Date().toISOString().slice(0, 10);
 }
 
+function parseTitleDeadline(title) {
+  if (!title) return null;
+  const months = {
+    january: '01',
+    february: '02',
+    march: '03',
+    april: '04',
+    may: '05',
+    june: '06',
+    july: '07',
+    august: '08',
+    september: '09',
+    october: '10',
+    november: '11',
+    december: '12',
+  };
+  const match = String(title).match(/\b(?:by|before|on)\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s+(\d{4})\b/i);
+  if (!match) return null;
+  const month = months[match[1].toLowerCase()];
+  const day = match[2].padStart(2, '0');
+  return `${match[3]}-${month}-${day}`;
+}
+
+function isRedeemedExit(pos, positionExists) {
+  // If the position is still present in the aggregate portfolio, this is a
+  // sell-down/rank-drop notification, not a redemption, even if Polymarket's
+  // raw endDate is stale or inherited from an event collection.
+  if (positionExists) return false;
+
+  const titleDeadline = parseTitleDeadline(pos?.title);
+  const today = new Date().toISOString().slice(0, 10);
+  if (titleDeadline && titleDeadline > today) return false;
+
+  return isExpired(pos?.endDate);
+}
+
 // Sum trade USD flow (BUY positive, SELL negative) per window for a specific
 // conditionId+outcomeIndex. Mirrors dashboard semantics.
 function computeWindowDeltas(changes, conditionId, outcomeIndex, totalExposure) {
@@ -371,7 +407,7 @@ export async function runNotifications(env) {
       // Exit (partial drop within top-200): activity required
       if (downCrossed.length && sizeChanged) {
         const deltas = computeWindowDeltas(changes, current.pos.conditionId, current.outcomeIndex, current.pos.totalExposure);
-        const redeemed = isExpired(current.pos.endDate);
+        const redeemed = isRedeemedExit(current.pos, true);
         // Exit chain shows downward threshold crossings, symmetric to entry.
         const exitMilestones = buildExitChain(prevRank, downCrossed);
         exitEvents.push({
@@ -406,12 +442,12 @@ export async function runNotifications(env) {
         const curTC   = fullPos.traderCount ?? (fullPos.traders?.length ?? 0);
         sizeChanged = Math.abs(curSize - (prev.size ?? 0)) > 0.001 || curTC !== (prev.traderCount ?? 0);
         displayPos = fullPos;
-        redeemed = isExpired(fullPos.endDate);
+        redeemed = isRedeemedExit(fullPos, true);
       } else {
         // Disappeared → infer redemption if we know endDate, else treat as fully sold.
         sizeChanged = true; // disappearance is itself activity
         displayPos = prev.lastPos || null;
-        redeemed = prev.endDate ? isExpired(prev.endDate) : false;
+        redeemed = isRedeemedExit(displayPos || prev, false);
       }
       if (!sizeChanged) continue;
       if (!displayPos) continue; // can't render without position metadata

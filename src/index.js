@@ -2,7 +2,7 @@
  * Polymarket Bot — Cloudflare Worker
  *
  * fetch handler:     Telegram webhook (user conversations)
- * scheduled handler: Notification cron (every 5 min)
+ * scheduled handler: Notification cron (every minute)
  */
 
 import { sendMessage, editMessage, answerCallback, checkMembership } from './tg.js';
