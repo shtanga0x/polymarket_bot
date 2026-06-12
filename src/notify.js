@@ -21,22 +21,18 @@ const MAX_MILESTONES  = 10; // cap chain length so a long-lived position can't g
 
 const SOURCES = [
   {
-    key:              'watch',
-    label:            { en: 'Watch', ru: 'Watch' },
-    emoji:            '👁',
-    url:              'https://watch.shtanga.xyz/',
-    dataUrl:          'https://data.shtanga.xyz/watch/aggregated_portfolio.json',
-    metaUrl:          'https://data.shtanga.xyz/watch/metadata.json',
-    recentChangesUrl: 'https://data.shtanga.xyz/watch/recent_changes.json',
+    key:     'watch',
+    label:   { en: 'Watch', ru: 'Watch' },
+    emoji:   '👁',
+    url:     'https://watch.shtanga.xyz/',
+    feedUrl: 'https://data.shtanga.xyz/watch/bot_feed.json',
   },
   {
-    key:              'core',
-    label:            { en: 'Core', ru: 'Core' },
-    emoji:            '📊',
-    url:              'https://core.shtanga.xyz/',
-    dataUrl:          'https://data.shtanga.xyz/core/aggregated_portfolio.json',
-    metaUrl:          'https://data.shtanga.xyz/core/metadata.json',
-    recentChangesUrl: 'https://data.shtanga.xyz/core/recent_changes.json',
+    key:     'core',
+    label:   { en: 'Core', ru: 'Core' },
+    emoji:   '📊',
+    url:     'https://core.shtanga.xyz/',
+    feedUrl: 'https://data.shtanga.xyz/core/bot_feed.json',
   },
 ];
 
@@ -87,6 +83,9 @@ function posKeyOf(pos) {
 }
 
 function aggregateSize(pos) {
+  // bot_feed.json carries the precomputed total; the traders array is the
+  // legacy fallback for the full aggregated_portfolio shape.
+  if (Number.isFinite(pos?.totalSize)) return pos.totalSize;
   if (!Array.isArray(pos.traders)) return 0;
   return pos.traders.reduce((s, t) => s + (parseFloat(t.size) || 0), 0);
 }
@@ -135,10 +134,29 @@ function isRedeemedExit(pos, positionExists) {
 
 // Sum trade USD flow (BUY positive, SELL negative) per window for a specific
 // conditionId+outcomeIndex. Mirrors dashboard semantics.
-function computeWindowDeltas(changes, conditionId, outcomeIndex, totalExposure) {
+function computeWindowDeltas(changes, conditionId, outcomeIndex, totalExposure, pos = null) {
+  const out = { h1: { usd: 0, pct: null }, d1: { usd: 0, pct: null }, w1: { usd: 0, pct: null } };
+
+  // Fast path: the pipeline precomputes chained per-window sums from the FULL
+  // activity history (h1 = last hour, d1 = 1h–24h, w1 = 1d–7d). Cumulative
+  // "vs now" deltas are their running sums.
+  if (pos?.windowChanges) {
+    const wc = pos.windowChanges;
+    const cum = { h1: wc.h1 || 0 };
+    cum.d1 = cum.h1 + (wc.d1 || 0);
+    cum.w1 = cum.d1 + (wc.w1 || 0);
+    for (const w of ['h1', 'd1', 'w1']) {
+      out[w].usd = cum[w];
+      const denom = totalExposure - cum[w];
+      if (denom > 0) out[w].pct = (cum[w] / denom) * 100;
+    }
+    return out;
+  }
+
+  // Fallback (positions that dropped out of the portfolio): sum raw change
+  // events from the feed.
   const now = Math.floor(Date.now() / 1000);
   const windows = { h1: now - 3600, d1: now - 24 * 3600, w1: now - 7 * 24 * 3600 };
-  const out = { h1: { usd: 0, pct: null }, d1: { usd: 0, pct: null }, w1: { usd: 0, pct: null } };
 
   for (const c of changes) {
     if (c.conditionId !== conditionId) continue;
@@ -319,23 +337,20 @@ export async function runNotifications(env, scheduledTime) {
     : SOURCES; // manual/webhook invocations still process everything
 
   for (const source of sources) {
-    // 1. Check freshness
-    const meta = await fetchJSON(source.metaUrl);
-    if (!meta?.last_updated) continue;
+    // 1+2. Single slim feed (~100KB) — the pipeline publishes bot_feed.json
+    // with exactly the fields we need. Parsing the full aggregated_portfolio
+    // (multi-MB) blew the Workers CPU limit and stalled notifications.
+    const feed = await fetchJSON(source.feedUrl);
+    if (!feed?.last_updated) continue;
 
     const state = await getState(env, source.key);
-    if (state.lastProcessed === meta.last_updated) continue;
+    if (state.lastProcessed === feed.last_updated) continue;
+    if (!feed.positions?.length) continue;
 
-    // 2. Fetch portfolio + recent_changes in parallel
-    const [portfolio, recentChanges] = await Promise.all([
-      fetchJSON(source.dataUrl),
-      fetchJSON(source.recentChangesUrl),
-    ]);
-    if (!portfolio?.positions?.length) continue;
-
-    const allPositions = portfolio.positions; // sorted by exposure desc
-    const totalPortfolioExposure = portfolio.summary?.totalExposure ?? 0;
-    const changes = recentChanges?.changes ?? [];
+    const meta = { last_updated: feed.last_updated };
+    const allPositions = feed.positions; // sorted by exposure desc
+    const totalPortfolioExposure = feed.summary?.totalExposure ?? 0;
+    const changes = feed.changes ?? [];
 
     // 3. Index prev snapshot by posKey
     const prevByKey = new Map();
@@ -414,7 +429,7 @@ export async function runNotifications(env, scheduledTime) {
 
       // Exit (partial drop within top-200): activity required
       if (downCrossed.length && sizeChanged) {
-        const deltas = computeWindowDeltas(changes, current.pos.conditionId, current.outcomeIndex, current.pos.totalExposure);
+        const deltas = computeWindowDeltas(changes, current.pos.conditionId, current.outcomeIndex, current.pos.totalExposure, current.pos);
         const redeemed = isRedeemedExit(current.pos, true);
         // Exit chain shows downward threshold crossings, symmetric to entry.
         const exitMilestones = buildExitChain(prevRank, downCrossed);
@@ -468,6 +483,7 @@ export async function runNotifications(env, scheduledTime) {
         displayPos.conditionId,
         displayPos.outcomeIndex ?? (displayPos.outcome === 'Yes' ? 1 : 0),
         currentExposureForDelta,
+        fullPos, // null when fully dropped out → falls back to change events
       );
 
       const exitMilestones = buildExitChain(prevRank, downCrossed);
