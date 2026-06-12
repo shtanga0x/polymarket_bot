@@ -307,10 +307,18 @@ async function getUser(env, chatId) {
 
 // ─── Main notification runner ──────────────────────────────────────────────
 
-export async function runNotifications(env) {
+export async function runNotifications(env, scheduledTime) {
   const { BOT_TOKEN: token } = env;
 
-  for (const source of SOURCES) {
+  // CPU budget: parsing both sites' multi-MB JSON in one tick exceeds the
+  // Workers CPU limit. Alternate sources by minute parity — each site is
+  // still checked every 2 minutes, matching the data refresh cadence.
+  const minute = Math.floor((scheduledTime ?? Date.now()) / 60_000);
+  const sources = scheduledTime !== undefined
+    ? [SOURCES[minute % SOURCES.length]]
+    : SOURCES; // manual/webhook invocations still process everything
+
+  for (const source of sources) {
     // 1. Check freshness
     const meta = await fetchJSON(source.metaUrl);
     if (!meta?.last_updated) continue;

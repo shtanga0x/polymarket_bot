@@ -213,7 +213,7 @@ export default {
     return new Response('OK');
   },
 
-  async scheduled(_event, env) {
-    await runNotifications(env);
+  async scheduled(event, env) {
+    await runNotifications(env, event.scheduledTime);
   },
 };
