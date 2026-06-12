@@ -30,8 +30,8 @@ export function topKeyboard(txt) {
 
 export function dashboardsKeyboard(txt) {
   return { inline_keyboard: [[
-    { text: txt.btnCoreDashboard,  url: 'https://shtanga0x.github.io/polymarket_core/'  },
-    { text: txt.btnWatchDashboard, url: 'https://shtanga0x.github.io/polymarket_watch/' },
+    { text: txt.btnCoreDashboard,  url: 'https://core.shtanga.xyz/'  },
+    { text: txt.btnWatchDashboard, url: 'https://watch.shtanga.xyz/' },
   ]]};
 }
 
