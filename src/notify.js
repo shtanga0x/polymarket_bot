@@ -12,6 +12,7 @@
  */
 
 import { sendMessage } from './tg.js';
+import { fingerprint, symbolForIndex } from './fingerprint.js';
 
 const POLYMARKET    = 'https://polymarket.com';
 const REFERRAL      = '?via=shtanga';
@@ -543,6 +544,9 @@ export async function runNotifications(env, scheduledTime) {
 
       const topLevel = user.topLevel ?? 10;
       const lang     = user.lang ?? 'en';
+      // Per-user fingerprint: visible glyph (assigned at activation; falls back to
+      // a chat_id-derived one) + invisible chat_id payload, applied at send time.
+      const symbol   = user.symbol ?? symbolForIndex(Number(userId));
 
       // Entry/progression: send if any up-crossed threshold is ≤ topLevel
       for (const ev of entryEvents) {
@@ -554,7 +558,7 @@ export async function runNotifications(env, scheduledTime) {
           prevTraderCount: ev.prev?.traderCount ?? null,
           totalPortfolioExposure,
         });
-        try { await sendMessage(token, userId, msg, { parse_mode: 'HTML' }); }
+        try { await sendMessage(token, userId, fingerprint(msg, userId, symbol), { parse_mode: 'HTML' }); }
         catch (err) { console.error(`Failed to notify ${userId}:`, err.message); }
         await new Promise(r => setTimeout(r, 50));
       }
@@ -572,7 +576,7 @@ export async function runNotifications(env, scheduledTime) {
           redeemed: ev.redeemed,
           totalPortfolioExposure,
         });
-        try { await sendMessage(token, userId, msg, { parse_mode: 'HTML' }); }
+        try { await sendMessage(token, userId, fingerprint(msg, userId, symbol), { parse_mode: 'HTML' }); }
         catch (err) { console.error(`Failed to notify ${userId}:`, err.message); }
         await new Promise(r => setTimeout(r, 50));
       }

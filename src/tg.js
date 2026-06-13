@@ -22,11 +22,37 @@ export const editMessage = (token, chatId, messageId, text, extra = {}) =>
 export const answerCallback = (token, id, text = '') =>
   call(token, 'answerCallbackQuery', { callback_query_id: id, text });
 
+// chat_member: a user's group status changed (join/leave/kick) — needs the bot
+// to be a group admin. my_chat_member: the BOT's own status changed.
 export const setWebhook = (token, url) =>
-  call(token, 'setWebhook', { url, allowed_updates: ['message', 'callback_query'] });
+  call(token, 'setWebhook', {
+    url,
+    allowed_updates: ['message', 'callback_query', 'chat_member', 'my_chat_member'],
+  });
 
+export const getWebhookInfo = token => call(token, 'getWebhookInfo');
+
+// Registers the command list so Telegram shows a ☰ menu next to the input —
+// members reach /dashboard with a tap instead of typing it.
+export const setMyCommands = (token, commands) =>
+  call(token, 'setMyCommands', { commands });
+
+// Like checkMembership but distinguishes "definitely not a member" from "could
+// not check" (bot not admin / transient error) — reconcile must never drop a
+// real member on an API failure.
+export async function getMemberStatus(token, channelId, userId) {
+  const res = await call(token, 'getChatMember', { chat_id: channelId, user_id: userId });
+  if (!res.ok) return { ok: false, error: res.description };
+  return { ok: true, status: res.result?.status, is_member: res.result?.is_member };
+}
+
+// Fails CLOSED: if the check errors (bot not yet a group admin), deny access —
+// the gate fronts a closed group, so nobody slips in while it's misconfigured.
 export async function checkMembership(token, channelId, userId) {
   const res = await call(token, 'getChatMember', { chat_id: channelId, user_id: userId });
-  if (!res.ok) return false;
+  if (!res.ok) {
+    console.error('getChatMember failed (bot not group admin?):', res.description);
+    return false;
+  }
   return ['member', 'administrator', 'creator'].includes(res.result?.status);
 }

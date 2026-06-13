@@ -5,10 +5,14 @@
  * scheduled handler: Notification cron (every minute)
  */
 
-import { sendMessage, editMessage, answerCallback, checkMembership } from './tg.js';
+import { sendMessage, editMessage, answerCallback, checkMembership, setWebhook, setMyCommands, getWebhookInfo } from './tg.js';
 import { t, portfolioLabel } from './i18n.js';
-import { langKeyboard, subKeyboard, portfolioKeyboard, topKeyboard, settingsKeyboard, dashboardsKeyboard } from './keyboards.js';
+import { langKeyboard, subKeyboard, noSubKeyboard, portfolioKeyboard, topKeyboard, settingsKeyboard, openDashboardKeyboard } from './keyboards.js';
 import { runNotifications } from './notify.js';
+import { recordStart, recordSubCheck, recordActivate, recordStop, recordRemoved } from './db.js';
+
+// D1 writes are tracking-only: never let one break a user's conversation.
+const track = p => Promise.resolve(p).catch(err => console.error('D1 track failed:', err?.message));
 
 // ─── State helpers ─────────────────────────────────────────────────────────
 
@@ -67,6 +71,7 @@ async function addToIndex(env, chatId) {
 async function handleStart(chatId, from, env) {
   const { BOT_TOKEN: token } = env;
   const user = await getUser(env, chatId);
+  await track(recordStart(env, chatId, from));
   await saveUser(env, chatId, {
     ...user,
     state: 'choosing_language',
@@ -94,20 +99,55 @@ async function handleSettings(chatId, env) {
 
 // ─── /stop ─────────────────────────────────────────────────────────────────
 
+/** Dashboard access is handled by @shtanga_gate_bot; just point the user there. */
 async function handleDashboards(chatId, env) {
   const { BOT_TOKEN: token } = env;
   const user = await getUser(env, chatId);
-  const lang = user.lang ?? 'en';
-  const txt  = t[lang];
-  await sendMessage(token, chatId, txt.dashboards, { reply_markup: dashboardsKeyboard(txt) });
+  const txt  = t[user.lang ?? 'en'];
+  await sendMessage(token, chatId, txt.dashboards, { reply_markup: openDashboardKeyboard(txt) });
 }
 
 async function handleStop(chatId, env) {
   const { BOT_TOKEN: token } = env;
   const user = await getUser(env, chatId);
   const lang = user.lang ?? 'en';
+  await track(recordStop(env, chatId));
   await saveUser(env, chatId, { ...user, active: false });
   await sendMessage(token, chatId, t[lang].stopped);
+}
+
+// ─── Group membership tracking ───────────────────────────────────────────────
+// A user is "in" the group while their status is member/admin/creator (or a
+// restricted member who is still present). Mirrors checkMembership().
+const stillInGroup = m =>
+  ['creator', 'administrator', 'member'].includes(m.status) ||
+  (m.status === 'restricted' && m.is_member);
+
+/** Revoke a user's access after they leave/are kicked — but only if they ever
+ *  used the bot, so unrelated group departures don't trigger DMs. */
+async function deactivateForRemoval(env, tgUser, reason) {
+  const { BOT_TOKEN: token } = env;
+  const chatId = tgUser.id;
+  const ids = await getUserIndex(env);
+  const wasSubscribed = ids.includes(chatId);
+  const user = await getUser(env, chatId);
+  const known = wasSubscribed || Object.keys(user).length > 0;
+  if (!known) return;
+
+  if (Object.keys(user).length) await saveUser(env, chatId, { ...user, active: false, removed: true });
+  if (wasSubscribed) await putR2Json(env.BOT_STATE, 'users/index.json', ids.filter(id => id !== chatId));
+  // Recorded as a D1 'removed' event; the control bot's cron relays it to the owner.
+  await track(recordRemoved(env, chatId, tgUser, reason, wasSubscribed));
+  const txt = t[user.lang ?? 'en'];
+  await sendMessage(token, chatId, txt.removed, { reply_markup: noSubKeyboard(txt) }).catch(() => {});
+}
+
+/** Telegram pushes this the moment a member's group status changes (admin-only). */
+async function handleChatMember(update, env) {
+  const cm = update.chat_member;
+  if (String(cm.chat?.id) !== String(env.CHANNEL_ID)) return; // only the gated group
+  if (stillInGroup(cm.new_chat_member)) return;               // joined or stayed
+  await deactivateForRemoval(env, cm.new_chat_member.user, cm.new_chat_member.status);
 }
 
 // ─── Message handler ────────────────────────────────────────────────────────
@@ -121,7 +161,8 @@ async function handleMessage(update, env) {
   if (text === '/start')      return handleStart(chatId, msg.from, env);
   if (text === '/settings')   return handleSettings(chatId, env);
   if (text === '/stop')       return handleStop(chatId, env);
-  if (text === '/dashboards') return handleDashboards(chatId, env);
+  if (text === '/dashboard' ||
+      text === '/dashboards') return handleDashboards(chatId, env);
 }
 
 // ─── Callback handler ───────────────────────────────────────────────────────
@@ -157,8 +198,9 @@ async function handleCallback(update, env) {
   // ── Subscription check ───────────────────────────────────────────────────
   if (data === 'check_sub') {
     const ok = await checkMembership(token, CHANNEL_ID, chatId);
+    await track(recordSubCheck(env, chatId, cb.from, ok));
     if (!ok) {
-      return sendMessage(token, chatId, txt.noSub, { reply_markup: subKeyboard(txt) });
+      return sendMessage(token, chatId, txt.noSub, { reply_markup: noSubKeyboard(txt) });
     }
     await saveUser(env, chatId, { ...user, state: 'choosing_portfolio' });
     await editMessage(token, chatId, msgId, txt.subOk);
@@ -175,10 +217,14 @@ async function handleCallback(update, env) {
   // ── Top-level choice ─────────────────────────────────────────────────────
   if (data.startsWith('top_')) {
     const topLevel = parseInt(data.slice(4));
-    await saveUser(env, chatId, { ...user, topLevel, active: true, state: 'active' });
+    // Activation assigns the user's visible fingerprint symbol (in D1); mirror it
+    // into the R2 profile so the notification hot path needs no D1 read.
+    const { symbol } = await recordActivate(env, chatId, lang).catch(() => ({}));
+    await saveUser(env, chatId, { ...user, topLevel, active: true, state: 'active', ...(symbol ? { symbol } : {}) });
     await addToIndex(env, chatId);
     const label = portfolioLabel(user.portfolio ?? 'both', lang);
-    return editMessage(token, chatId, msgId, txt.configured(label, topLevel));
+    return editMessage(token, chatId, msgId, txt.configured(label, topLevel),
+      { reply_markup: openDashboardKeyboard(txt) });
   }
 
   // ── Settings actions ─────────────────────────────────────────────────────
@@ -188,12 +234,14 @@ async function handleCallback(update, env) {
   }
 
   if (data === 'toggle_off') {
+    await track(recordStop(env, chatId));
     await saveUser(env, chatId, { ...user, active: false });
     return editMessage(token, chatId, msgId, txt.stopped);
   }
 
   if (data === 'toggle_on') {
-    await saveUser(env, chatId, { ...user, active: true });
+    const { symbol } = await recordActivate(env, chatId, lang).catch(() => ({}));
+    await saveUser(env, chatId, { ...user, active: true, ...(symbol ? { symbol } : {}) });
     return editMessage(token, chatId, msgId, txt.resumed);
   }
 }
@@ -202,11 +250,31 @@ async function handleCallback(update, env) {
 
 export default {
   async fetch(req, env) {
+    const url = new URL(req.url);
+    // Re-register the webhook (and its allowed_updates) using the bot's own
+    // token, so the secret is never handled outside the worker.
+    if (req.method === 'GET' && url.pathname === '/setup') {
+      await setWebhook(env.BOT_TOKEN, url.origin);
+      await setMyCommands(env.BOT_TOKEN, [
+        { command: 'dashboard', description: '📊 Open the dashboards' },
+        { command: 'settings',  description: '⚙️ Change your settings' },
+        { command: 'stop',      description: '🔕 Turn off notifications' },
+        { command: 'start',     description: '🔄 Restart / re-check access' },
+      ]);
+      const info = await getWebhookInfo(env.BOT_TOKEN);
+      return new Response(JSON.stringify(info), { headers: { 'content-type': 'application/json' } });
+    }
     if (req.method !== 'POST') return new Response('OK');
     try {
       const update = await req.json();
-      if (update.callback_query) await handleCallback(update, env);
-      else if (update.message)   await handleMessage(update, env);
+      if (update.callback_query)      await handleCallback(update, env);
+      else if (update.message)        await handleMessage(update, env);
+      else if (update.chat_member)    await handleChatMember(update, env);
+      else if (update.my_chat_member) {
+        const m = update.my_chat_member;
+        if (String(m.chat?.id) === String(env.CHANNEL_ID) && !stillInGroup(m.new_chat_member))
+          console.warn('polymarket-bot lost membership/admin in the gated group — sub checks will fail closed.');
+      }
     } catch (err) {
       console.error('Webhook error:', err);
     }

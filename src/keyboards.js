@@ -5,10 +5,18 @@ export function langKeyboard(txt) {
   ]]};
 }
 
+// Closed group: no invite link is shown — membership is granted by the manager,
+// the bot only verifies it.
 export function subKeyboard(txt) {
   return { inline_keyboard: [
-    [{ text: txt.btnFollow, url: 'https://t.me/shtanga0x' }],
-    [{ text: txt.btnCheck,  callback_data: 'check_sub'    }],
+    [{ text: txt.btnCheck, callback_data: 'check_sub' }],
+  ]};
+}
+
+export function noSubKeyboard(txt) {
+  return { inline_keyboard: [
+    [{ text: txt.btnManager,  url: 'https://t.me/shtanga0xc' }],
+    [{ text: txt.btnTryAgain, callback_data: 'check_sub'     }],
   ]};
 }
 
@@ -28,15 +36,17 @@ export function topKeyboard(txt) {
   ]]};
 }
 
-export function dashboardsKeyboard(txt) {
-  return { inline_keyboard: [[
-    { text: txt.btnCoreDashboard,  url: 'https://core.shtanga.xyz/'  },
-    { text: txt.btnWatchDashboard, url: 'https://watch.shtanga.xyz/' },
-  ]]};
+// All dashboard access lives in @shtanga_gate_bot now. This bot no longer mints
+// links; its dashboard button just sends the user to the access hub.
+const GATE_BOT = 'https://t.me/shtanga_gate_bot';
+
+export function openDashboardKeyboard(txt) {
+  return { inline_keyboard: [[{ text: txt.btnOpenDashboard, url: GATE_BOT }]] };
 }
 
 export function settingsKeyboard(txt, active) {
   return { inline_keyboard: [
+    [{ text: txt.btnOpenDashboard,                        url: GATE_BOT }],
     [{ text: txt.btnChange,                               callback_data: 'change_settings' }],
     [{ text: active ? txt.btnStop : txt.btnResume,        callback_data: active ? 'toggle_off' : 'toggle_on' }],
   ]};

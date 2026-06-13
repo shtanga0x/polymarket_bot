@@ -16,6 +16,12 @@ id = "ac65f259d26749cfa735493ffa8a82e7"
 binding = "BOT_STATE"
 bucket_name = "polymarket-bot-state"
 
+# Shared cross-project user/event database (see hyper_bot/schema.sql).
+[[d1_databases]]
+binding = "DB"
+database_name = "shtanga-users"
+database_id = "961c61d8-6076-44cc-a613-3929e5110832"
+
 # Set secrets after deploy:
 #   npx wrangler secret put BOT_TOKEN
-#   npx wrangler secret put CHANNEL_ID   ← numeric ID of @shtanga0x, e.g. -1001234567890
+#   npx wrangler secret put CHANNEL_ID   ← numeric ID of the closed group, e.g. -1003468238602
