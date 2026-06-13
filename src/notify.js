@@ -19,6 +19,11 @@ const REFERRAL      = '?via=shtanga';
 const SNAPSHOT_SIZE   = 200; // track top-200 so positions falling fast still have prevRank
 const THRESHOLDS      = [30, 15, 10, 5, 4, 3, 2, 1]; // descending — used for both entry & exit
 const MAX_MILESTONES  = 10; // cap chain length so a long-lived position can't grow snapshot unboundedly
+// How long a rank-progression chain stays "live". A position that crossed
+// #31 → #9 → #4 and then sits idle for hours shouldn't re-print that whole
+// passed path when it later ticks to #3 — after this window the chain resets
+// so the next message shows only the fresh movement (e.g. "#4 → #3").
+const MILESTONE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 const SOURCES = [
   {
@@ -332,7 +337,8 @@ export async function runNotifications(env, scheduledTime) {
   // CPU budget: parsing both sites' multi-MB JSON in one tick exceeds the
   // Workers CPU limit. Alternate sources by minute parity — each site is
   // still checked every 2 minutes, matching the data refresh cadence.
-  const minute = Math.floor((scheduledTime ?? Date.now()) / 60_000);
+  const nowMs = scheduledTime ?? Date.now(); // tick time — used to age out rank chains
+  const minute = Math.floor(nowMs / 60_000);
   const sources = scheduledTime !== undefined
     ? [SOURCES[minute % SOURCES.length]]
     : SOURCES; // manual/webhook invocations still process everything
@@ -393,6 +399,11 @@ export async function runNotifications(env, scheduledTime) {
       const prevSize        = prev?.size ?? null;
       const prevTraderCount = prev?.traderCount ?? null;
       const prevMilestones  = prev?.milestones ?? [];
+      const prevMilestonesTs = prev?.milestonesTs ?? null;
+      // Stale once the chain hasn't advanced within the TTL (or predates this
+      // field, e.g. snapshots written before TTL tracking existed).
+      const chainStale = prevMilestonesTs == null
+        || (nowMs - prevMilestonesTs) > MILESTONE_TTL_MS;
 
       // Activity gate: size or traderCount must have changed.
       // For brand-new positions in snapshot, treat as "active" (real entry).
@@ -410,9 +421,12 @@ export async function runNotifications(env, scheduledTime) {
 
       // Entry / progression: any up-crosses (gated by activity)
       if (upCrossed.length && sizeChanged) {
-        // Fresh start when: never tracked, was outside top-30, or chain was reset
-        // by a recent exit (prevMilestones empty).
-        const startsFresh = prevRank == null || prevRank > 30 || prevMilestones.length === 0;
+        // Fresh start when: never tracked, was outside top-30, chain was reset
+        // by a recent exit (prevMilestones empty), OR the prior chain has gone
+        // stale (>1h) — so we show only the new movement instead of re-printing
+        // a path the user already saw.
+        const startsFresh = prevRank == null || prevRank > 30
+          || prevMilestones.length === 0 || chainStale;
         let milestones = startsFresh
           ? [prevRank /* may be null → renders as "NEW" */, current.rank]
           : [...prevMilestones, current.rank];
@@ -421,11 +435,20 @@ export async function runNotifications(env, scheduledTime) {
           milestones = [milestones[0], ...milestones.slice(-(MAX_MILESTONES - 1))];
         }
         entryEvents.push({ key, current, prev, milestones, upCrossed });
-        // Stamp milestones on the current snapshot entry
+        // Stamp milestones (+ advance timestamp) on the current snapshot entry
         current.nextMilestones = milestones;
+        current.nextMilestonesTs = nowMs;
       } else {
-        // Carry milestones forward unchanged
-        current.nextMilestones = startsFreshIfNeeded(prevMilestones, prevRank, current.rank);
+        // Carry milestones forward — but drop a stale chain so a later cross
+        // starts fresh rather than appending to an old passed path.
+        const kept = startsFreshIfNeeded(prevMilestones, prevRank, current.rank);
+        if (kept.length && !chainStale) {
+          current.nextMilestones = kept;
+          current.nextMilestonesTs = prevMilestonesTs;
+        } else {
+          current.nextMilestones = [];
+          current.nextMilestonesTs = null;
+        }
       }
 
       // Exit (partial drop within top-200): activity required
@@ -441,6 +464,7 @@ export async function runNotifications(env, scheduledTime) {
         });
         // After exit, reset milestones for re-entry
         current.nextMilestones = [];
+        current.nextMilestonesTs = null;
       }
     }
 
@@ -511,6 +535,7 @@ export async function runNotifications(env, scheduledTime) {
         traderCount:  current.traderCount,
         exposure:     current.pos.totalExposure,
         milestones:   current.nextMilestones || [],
+        milestonesTs: current.nextMilestonesTs ?? null,
         // Cache the position payload so a subsequent disappearance can still render a message.
         lastPos: {
           title:        current.pos.title,
