@@ -211,22 +211,55 @@ function renderTraderCount(prevTC, currentTC) {
 
 // ─── Message builders ───────────────────────────────────────────────────────
 
-function buildEntryMessage({ pos, source, lang, milestones, prevTraderCount, totalPortfolioExposure }) {
-  const portfolioLink = `<a href="${source.url}">${source.label[lang]} Portfolio</a>`;
-  const header = `${source.emoji} <b>${portfolioLink}</b> ${renderRankChain(milestones)}`;
+// Price-change % from entry to current; null when entry price is unknown.
+function pricePct(pos) {
+  if (pos.priceChangePct != null && !isNaN(pos.priceChangePct)) return parseFloat(pos.priceChangePct);
+  const e = parseFloat(pos.avgEntry), c = parseFloat(pos.curPrice);
+  if (!(e > 0) || isNaN(c)) return null;
+  return ((c - e) / e) * 100;
+}
 
-  const outcomeIcon = pos.outcome === 'Yes' ? '🟢' : '🔴';
-  const priceChange = pos.priceChangePct != null ? ` (${fmtPct(pos.priceChangePct)})` : '';
+// "🟢 Yes | Entry: 34.0¢ → Now: 83.0¢ (+144.1%)" — the entry→now price line.
+// `sold` forces the red marker for a sell-down exit (outcome colour otherwise).
+function renderPriceLine(pos, sold = false) {
+  const icon = sold ? '🔴' : (pos.outcome === 'Yes' ? '🟢' : '🔴');
+  if (parseFloat(pos.avgEntry) > 0) {
+    const pc = pricePct(pos);
+    const pct = pc != null ? ` (${fmtPct(pc)})` : '';
+    return `${icon} <b>${pos.outcome}</b> | Entry: ${fmtCents(pos.avgEntry)} → Now: ${fmtCents(pos.curPrice)}${pct}`;
+  }
+  return `${icon} <b>${pos.outcome}</b> | Now: ${fmtCents(pos.curPrice)}`;
+}
+
+// The 1h / 24h / 1w trade-flow lines — shown on every position-change message.
+// Label is "24h" (not "1d") to stay consistent with the rest of the UI.
+function renderDeltaLines(deltas) {
+  return [
+    `📊 1h:  ${fmtUSDSigned(deltas.h1.usd)} (${fmtPct(deltas.h1.pct)})`,
+    `📊 24h: ${fmtUSDSigned(deltas.d1.usd)} (${fmtPct(deltas.d1.pct)})`,
+    `📊 1w:  ${fmtUSDSigned(deltas.w1.usd)} (${fmtPct(deltas.w1.pct)})`,
+  ];
+}
+
+function exposureLine(pos, prevTraderCount, totalPortfolioExposure) {
   const exposurePct = totalPortfolioExposure > 0
     ? ` (${(pos.totalExposure / totalPortfolioExposure * 100).toFixed(2)}%)`
     : '';
+  return `💰 Exposure: <b>${fmtUSD(pos.totalExposure)}${exposurePct}</b>  |  👥 ${renderTraderCount(prevTraderCount, pos.traderCount)}`;
+}
+
+function buildEntryMessage({ pos, source, lang, milestones, prevTraderCount, totalPortfolioExposure, deltas }) {
+  const portfolioLink = `<a href="${source.url}">${source.label[lang]} Portfolio</a>`;
+  const header = `${source.emoji} <b>${portfolioLink}</b> ${renderRankChain(milestones)}`;
 
   return [
     header,
     '',
     `📌 <a href="${marketUrl(pos)}">${escHtml(pos.title)}</a>`,
-    `${outcomeIcon} <b>${pos.outcome}</b> | Entry: ${fmtCents(pos.avgEntry)} → Now: ${fmtCents(pos.curPrice)}${priceChange}`,
-    `💰 Exposure: <b>${fmtUSD(pos.totalExposure)}${exposurePct}</b>  |  👥 ${renderTraderCount(prevTraderCount, pos.traderCount)}`,
+    renderPriceLine(pos, false),
+    exposureLine(pos, prevTraderCount, totalPortfolioExposure),
+    '',
+    ...renderDeltaLines(deltas),
   ].join('\n');
 }
 
@@ -238,29 +271,22 @@ function buildExitMessage({ pos, source, lang, milestones, prevTraderCount, delt
   // milestones ends with `null` so renderRankChain produces "→ OUT"
   const header = `${source.emoji} <b>${portfolioLink}</b> ${renderRankChain(milestones)}`;
 
-  const outcomeIcon = pos.outcome === 'Yes' ? '🟢' : '🔴';
+  // A redemption shows its final settle price; a sell-down mirrors the entry
+  // message's entry→now line but with the red marker.
   const priceLine = redeemed
-    ? `${outcomeIcon} <b>${pos.outcome}</b> | Final: ${fmtCents(pos.curPrice)}`
-    : `${outcomeIcon} <b>${pos.outcome}</b> | Now: ${fmtCents(pos.curPrice)}`;
+    ? `${pos.outcome === 'Yes' ? '🟢' : '🔴'} <b>${pos.outcome}</b> | Final: ${fmtCents(pos.curPrice)}`
+    : renderPriceLine(pos, true);
 
-  const exposurePct = totalPortfolioExposure > 0
-    ? ` (${(pos.totalExposure / totalPortfolioExposure * 100).toFixed(2)}%)`
-    : '';
-  const exposureLine = `💰 Exposure: <b>${fmtUSD(pos.totalExposure)}${exposurePct}</b>  |  👥 ${renderTraderCount(prevTraderCount, pos.traderCount)}`;
-
-  const lines = [
+  return [
     header,
     reason,
     '',
     `📌 <a href="${marketUrl(pos)}">${escHtml(pos.title)}</a>`,
     priceLine,
-    exposureLine,
+    exposureLine(pos, prevTraderCount, totalPortfolioExposure),
     '',
-    `📊 1h:  ${fmtUSDSigned(deltas.h1.usd)} (${fmtPct(deltas.h1.pct)})`,
-    `📊 1d:  ${fmtUSDSigned(deltas.d1.usd)} (${fmtPct(deltas.d1.pct)})`,
-    `📊 1w:  ${fmtUSDSigned(deltas.w1.usd)} (${fmtPct(deltas.w1.pct)})`,
-  ];
-  return lines.join('\n');
+    ...renderDeltaLines(deltas),
+  ].join('\n');
 }
 
 // ─── State helpers ─────────────────────────────────────────────────────────
@@ -344,6 +370,21 @@ export async function runNotifications(env, scheduledTime) {
     : SOURCES; // manual/webhook invocations still process everything
 
   for (const source of sources) {
+    // Best-effort per-source lock (R2 is read-after-write consistent). Cloudflare
+    // cron can occasionally double-deliver or overlap a tick; without
+    // serialization two concurrent runs read the same pre-snapshot and both
+    // announce the same rank cross (observed as duplicate messages). A fresh
+    // lock makes the second run skip — the next tick processes the latest feed.
+    // The ts guards against a crashed run holding it forever; no explicit
+    // release needed since the same source is only revisited ~2 min later.
+    const lockKey = `locks/notify-${source.key}.json`;
+    const lockObj = await env.BOT_STATE.get(lockKey);
+    if (lockObj) {
+      const { ts = 0 } = await lockObj.json().catch(() => ({}));
+      if (nowMs - ts < 90_000) continue;
+    }
+    await env.BOT_STATE.put(lockKey, JSON.stringify({ ts: nowMs }), { httpMetadata: { contentType: 'application/json' } });
+
     // 1+2. Single slim feed (~100KB) — the pipeline publishes bot_feed.json
     // with exactly the fields we need. Parsing the full aggregated_portfolio
     // (multi-MB) blew the Workers CPU limit and stalled notifications.
@@ -434,7 +475,9 @@ export async function runNotifications(env, scheduledTime) {
         if (milestones.length > MAX_MILESTONES) {
           milestones = [milestones[0], ...milestones.slice(-(MAX_MILESTONES - 1))];
         }
-        entryEvents.push({ key, current, prev, milestones, upCrossed });
+        // Entry/progression messages now carry the same 1h/24h/1w flow lines.
+        const deltas = computeWindowDeltas(changes, current.pos.conditionId, current.outcomeIndex, current.pos.totalExposure, current.pos);
+        entryEvents.push({ key, current, prev, milestones, upCrossed, deltas });
         // Stamp milestones (+ advance timestamp) on the current snapshot entry
         current.nextMilestones = milestones;
         current.nextMilestonesTs = nowMs;
@@ -543,7 +586,9 @@ export async function runNotifications(env, scheduledTime) {
           eventSlug:    current.pos.eventSlug,
           outcome:      current.pos.outcome,
           outcomeIndex: current.outcomeIndex,
+          avgEntry:     current.pos.avgEntry,
           curPrice:     current.pos.curPrice,
+          priceChangePct: current.pos.priceChangePct,
           conditionId:  current.pos.conditionId,
           totalExposure: current.pos.totalExposure,
           endDate:      current.pos.endDate,
@@ -582,6 +627,7 @@ export async function runNotifications(env, scheduledTime) {
           milestones: ev.milestones,
           prevTraderCount: ev.prev?.traderCount ?? null,
           totalPortfolioExposure,
+          deltas: ev.deltas,
         });
         try { await sendMessage(token, userId, fingerprint(msg, userId, symbol), { parse_mode: 'HTML' }); }
         catch (err) { console.error(`Failed to notify ${userId}:`, err.message); }
