@@ -49,6 +49,16 @@ function hasRecentFlow(deltas) {
   return Math.abs(deltas?.h1?.usd ?? 0) >= MIN_RECENT_FLOW_USD;
 }
 
+// Merge/split coupling. A MERGE redeems equal YES+NO share pairs back into
+// collateral and a SPLIT mints them — both outcomes of one market move by the
+// SAME share amount in the SAME direction in a single tick. Neither is a
+// directional bet, yet each side produces real flow and can cross thresholds,
+// firing two coupled notifications. When both outcomes move together we keep only
+// the side with the larger |share change| (the net directional move) and drop the
+// other; when the changes are equal (a pure merge/split) we drop both. Two sides
+// moving in OPPOSITE directions are two real trades — left alone.
+const MERGE_EQ_TOLERANCE = 0.02; // |ΔYES−ΔNO| within 2% of the larger ⇒ "equal"
+
 const SOURCES = [
   {
     key:     'watch',
@@ -92,7 +102,10 @@ function fmtPct(v) {
   if (v == null || isNaN(v)) return 'n/a';
   const n = parseFloat(v);
   const sign = n >= 0 ? '+' : '';
-  return `${sign}${n.toFixed(1)}%`;
+  // A position built from near-zero shows a huge but truthful % — drop the
+  // decimal past 1000% so it reads cleanly (e.g. +5118%, not +5118.4%).
+  const digits = Math.abs(n) >= 1000 ? 0 : 1;
+  return `${sign}${n.toFixed(digits)}%`;
 }
 
 function escHtml(s) {
@@ -162,45 +175,48 @@ function isRedeemedExit(pos, positionExists) {
   return isExpired(pos?.endDate);
 }
 
-// Sum trade USD flow (BUY positive, SELL negative) per window for a specific
-// conditionId+outcomeIndex. Mirrors dashboard semantics.
+// Trade USD flow (BUY positive, SELL negative) per DISJOINT window for a specific
+// conditionId+outcomeIndex: h1 = now→1h, d1 = 1h→24h, w1 = 24h→1w (each slice
+// stands alone — they do NOT include each other). The relative % for a slice is
+// its flow over the position's value at the START (older end) of that slice,
+// reconstructed by walking exposure backwards from now — i.e. the true % change
+// the position underwent during that interval. Mirrors dashboard semantics.
 function computeWindowDeltas(changes, conditionId, outcomeIndex, totalExposure, pos = null) {
   const out = { h1: { usd: 0, pct: null }, d1: { usd: 0, pct: null }, w1: { usd: 0, pct: null } };
 
-  // Fast path: the pipeline precomputes chained per-window sums from the FULL
-  // activity history (h1 = last hour, d1 = 1h–24h, w1 = 1d–7d). Cumulative
-  // "vs now" deltas are their running sums.
+  // Per-interval (disjoint) USD flow.
+  let per;
   if (pos?.windowChanges) {
+    // Fast path: the pipeline precomputes chained non-overlapping window sums.
     const wc = pos.windowChanges;
-    const cum = { h1: wc.h1 || 0 };
-    cum.d1 = cum.h1 + (wc.d1 || 0);
-    cum.w1 = cum.d1 + (wc.w1 || 0);
-    for (const w of ['h1', 'd1', 'w1']) {
-      out[w].usd = cum[w];
-      const denom = totalExposure - cum[w];
-      if (denom > 0) out[w].pct = (cum[w] / denom) * 100;
-    }
-    return out;
-  }
-
-  // Fallback (positions that dropped out of the portfolio): sum raw change
-  // events from the feed.
-  const now = Math.floor(Date.now() / 1000);
-  const windows = { h1: now - 3600, d1: now - 24 * 3600, w1: now - 7 * 24 * 3600 };
-
-  for (const c of changes) {
-    if (c.conditionId !== conditionId) continue;
-    if (c.outcomeIndex !== undefined && c.outcomeIndex !== outcomeIndex) continue;
-    const ts = c.timestamp || 0;
-    for (const w of ['h1', 'd1', 'w1']) {
-      if (ts >= windows[w]) out[w].usd += (c.delta || 0);
+    per = { h1: wc.h1 || 0, d1: wc.d1 || 0, w1: wc.w1 || 0 };
+  } else {
+    // Fallback (positions that dropped out): bucket raw change events into the
+    // disjoint windows by timestamp.
+    per = { h1: 0, d1: 0, w1: 0 };
+    const now = Math.floor(Date.now() / 1000);
+    const b1h = now - 3600, b24h = now - 24 * 3600, b1w = now - 7 * 24 * 3600;
+    for (const c of changes) {
+      if (c.conditionId !== conditionId) continue;
+      if (c.outcomeIndex !== undefined && c.outcomeIndex !== outcomeIndex) continue;
+      const ts = c.timestamp || 0;
+      const d  = c.delta || 0;
+      if (ts >= b1h)       per.h1 += d;
+      else if (ts >= b24h) per.d1 += d;
+      else if (ts >= b1w)  per.w1 += d;
     }
   }
+
+  // Reconstruct the position's exposure at each interval's older boundary.
+  const e1h  = totalExposure - per.h1; // value 1h ago
+  const e24h = e1h - per.d1;           // value 24h ago
+  const e1w  = e24h - per.w1;          // value 1w ago
+  const base = { h1: e1h, d1: e24h, w1: e1w };
   for (const w of ['h1', 'd1', 'w1']) {
-    // Denominator = pre-window exposure ≈ current − delta.
-    // For sells, this bounds |pct| to 100% (-100% = fully closed).
-    const denom = totalExposure - out[w].usd;
-    if (denom > 0) out[w].pct = (out[w].usd / denom) * 100;
+    out[w].usd = per[w];
+    // % change over the slice vs its starting value. A full sell within a slice
+    // gives base = flow magnitude → −100%, as expected.
+    if (base[w] > 0) out[w].pct = (per[w] / base[w]) * 100;
   }
   return out;
 }
@@ -255,13 +271,14 @@ function renderPriceLine(pos, sold = false) {
   return `${icon} <b>${pos.outcome}</b> | Now: ${fmtCents(pos.curPrice)}`;
 }
 
-// The 1h / 24h / 1w trade-flow lines — shown on every position-change message.
-// Label is "24h" (not "1d") to stay consistent with the rest of the UI.
+// Trade-flow lines — shown on every position-change message. Each line is a
+// DISJOINT interval (not cumulative): last hour, the 1h→24h slice, the 24h→1w
+// slice. % is the change over that slice vs its starting value.
 function renderDeltaLines(deltas) {
   return [
-    `📊 1h:  ${fmtUSDSigned(deltas.h1.usd)} (${fmtPct(deltas.h1.pct)})`,
-    `📊 24h: ${fmtUSDSigned(deltas.d1.usd)} (${fmtPct(deltas.d1.pct)})`,
-    `📊 1w:  ${fmtUSDSigned(deltas.w1.usd)} (${fmtPct(deltas.w1.pct)})`,
+    `📊 1h:     ${fmtUSDSigned(deltas.h1.usd)} (${fmtPct(deltas.h1.pct)})`,
+    `📊 1h–24h: ${fmtUSDSigned(deltas.d1.usd)} (${fmtPct(deltas.d1.pct)})`,
+    `📊 24h–1w: ${fmtUSDSigned(deltas.w1.usd)} (${fmtPct(deltas.w1.pct)})`,
   ];
 }
 
@@ -454,8 +471,8 @@ export async function runNotifications(env, scheduledTime) {
     // 6. Compute notifications. Two sources of events:
     //    (a) positions in current top-200 — possible entry/progression OR partial drop
     //    (b) positions in prev snapshot but not in current top-200 — drop-out events
-    const entryEvents = []; // { pos, key, prev, current, milestones, upCrossed }
-    const exitEvents  = []; // { pos, key, prev, current, milestones, downCrossed, deltas, redeemed }
+    let entryEvents = []; // { pos, key, prev, current, milestones, upCrossed }
+    let exitEvents  = []; // { pos, key, prev, current, milestones, downCrossed, deltas, redeemed }
 
     // Pass A: current top-200
     for (const [key, current] of currentByKey) {
@@ -499,7 +516,12 @@ export async function runNotifications(env, scheduledTime) {
         if (milestones.length > MAX_MILESTONES) {
           milestones = [milestones[0], ...milestones.slice(-(MAX_MILESTONES - 1))];
         }
-        entryEvents.push({ key, current, prev, milestones, upCrossed, deltas });
+        entryEvents.push({
+          key, current, prev, milestones, upCrossed, deltas,
+          conditionId: current.pos.conditionId,
+          outcomeIndex: current.outcomeIndex,
+          shareDelta: current.size - (prev?.size ?? 0),
+        });
         // Stamp milestones (+ advance timestamp) on the current snapshot entry
         current.nextMilestones = milestones;
         current.nextMilestonesTs = nowMs;
@@ -528,6 +550,9 @@ export async function runNotifications(env, scheduledTime) {
             key, current, prev,
             milestones: exitMilestones,
             downCrossed, deltas, redeemed,
+            conditionId: current.pos.conditionId,
+            outcomeIndex: current.outcomeIndex,
+            shareDelta: current.size - (prev?.size ?? 0),
           });
           // After exit, reset milestones for re-entry
           current.nextMilestones = [];
@@ -586,8 +611,35 @@ export async function runNotifications(env, scheduledTime) {
         downCrossed,
         deltas,
         redeemed,
+        conditionId: displayPos.conditionId,
+        outcomeIndex: displayPos.outcomeIndex ?? (displayPos.outcome === 'Yes' ? 1 : 0),
+        shareDelta: (fullPos ? aggregateSize(fullPos) : 0) - (prev.size ?? 0),
       });
     }
+
+    // 6b. Merge/split dedup. Build per-outcome share deltas for the whole feed so
+    // we can see a market's *other* outcome even when it didn't itself fire, then
+    // drop coupled merge/split events (keep only the larger directional side).
+    const shareDeltaByKey = new Map();
+    for (const p of allPositions) {
+      const idx = p.outcomeIndex ?? (p.outcome === 'Yes' ? 1 : 0);
+      const k = `${p.conditionId}-${idx}`;
+      shareDeltaByKey.set(k, aggregateSize(p) - (prevByKey.get(k)?.size ?? 0));
+    }
+    for (const [k, prev] of prevByKey) {
+      if (!shareDeltaByKey.has(k)) shareDeltaByKey.set(k, 0 - (prev.size ?? 0)); // dropped out
+    }
+    const dropMergeSplit = (ev) => {
+      const sib = shareDeltaByKey.get(`${ev.conditionId}-${1 - ev.outcomeIndex}`);
+      if (sib == null) return false;                                  // no sibling data
+      const self = ev.shareDelta ?? 0;
+      if (self === 0 || Math.sign(self) !== Math.sign(sib)) return false; // not same-direction
+      const a = Math.abs(self), b = Math.abs(sib), big = Math.max(a, b);
+      if (big > 0 && Math.abs(a - b) <= big * MERGE_EQ_TOLERANCE) return true; // ~equal → pure merge/split
+      return a < b;                                                   // keep only the larger side
+    };
+    entryEvents = entryEvents.filter(ev => !dropMergeSplit(ev));
+    exitEvents  = exitEvents.filter(ev => !dropMergeSplit(ev));
 
     // 7. Build new snapshot (from current top-200 + carry-forward of milestones)
     const newSnapshot = [];
@@ -637,6 +689,7 @@ export async function runNotifications(env, scheduledTime) {
     }
 
     // 10. Notify subscribers
+    console.log(`[notify] ${source.key}: sending ${entryEvents.length} entr${entryEvents.length === 1 ? 'y' : 'ies'}, ${exitEvents.length} exit${exitEvents.length === 1 ? '' : 's'} — ${[...entryEvents, ...exitEvents].map(e => `${e.current?.pos?.title?.slice(0, 30)}[${e.outcomeIndex}]`).join('; ')}`);
     const userIds = await getSubscribers(env);
     for (const userId of userIds) {
       const user = await getUser(env, userId);
