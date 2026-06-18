@@ -45,9 +45,14 @@ const MAX_EVENTS_PER_TICK = 12;
 // 1h == $0. Redemptions (resolved markets) are legitimately flow-less, so the
 // exit path exempts them separately.
 const MIN_RECENT_FLOW_USD = 1; // |last-hour net flow| below this ≈ no real trade
-function hasRecentFlow(deltas) {
-  return Math.abs(deltas?.h1?.usd ?? 0) >= MIN_RECENT_FLOW_USD;
-}
+// DIRECTIONAL gates. Rank is ordered by exposure = shares × price, so a position
+// can cross the #30 boundary purely on a PRICE move while it's actually being
+// bought (or sold) the other way. Keying off |flow| then mislabels a price-driven
+// dip on a net-bought position as a "sold down" exit (and flaps it across the
+// boundary). So an entry/progression requires net BUYING in the last hour and a
+// sell-down exit requires net SELLING; redemptions (flow-less) are handled apart.
+function recentBuy(deltas)  { return (deltas?.h1?.usd ?? 0) >=  MIN_RECENT_FLOW_USD; }
+function recentSell(deltas) { return (deltas?.h1?.usd ?? 0) <= -MIN_RECENT_FLOW_USD; }
 
 // Merge/split coupling. A MERGE redeems equal YES+NO share pairs back into
 // collateral and a SPLIT mints them — both outcomes of one market move by the
@@ -101,11 +106,11 @@ function fmtCents(v) {
 function fmtPct(v) {
   if (v == null || isNaN(v)) return 'n/a';
   const n = parseFloat(v);
-  const sign = n >= 0 ? '+' : '';
-  // A position built from near-zero shows a huge but truthful % — drop the
-  // decimal past 1000% so it reads cleanly (e.g. +5118%, not +5118.4%).
-  const digits = Math.abs(n) >= 1000 ? 0 : 1;
-  return `${sign}${n.toFixed(digits)}%`;
+  // A position built from (or sold to) near-zero at a slice boundary yields a
+  // truthful but unreadable % — clamp the display to ±999%.
+  if (n > 999)  return '>+999%';
+  if (n < -999) return '<-999%';
+  return `${n >= 0 ? '+' : ''}${n.toFixed(1)}%`;
 }
 
 function escHtml(s) {
@@ -493,16 +498,17 @@ export async function runNotifications(env, scheduledTime) {
         prevRank != null && prevRank <= T && current.rank > T
       );
 
-      // Recent trade flow for this position — the activity gate (see
-      // hasRecentFlow) and the message body share it. Computed once, only when a
+      // Recent trade flow for this position — the directional gates (recentBuy /
+      // recentSell) and the message body share it. Computed once, only when a
       // threshold actually crossed.
       const deltas = (upCrossed.length || downCrossed.length)
         ? computeWindowDeltas(changes, current.pos.conditionId, current.outcomeIndex, current.pos.totalExposure, current.pos)
         : null;
 
-      // Entry / progression: gated on a real recent trade — not a price-drift /
-      // displacement / stale-refresh rank shift.
-      if (upCrossed.length && hasRecentFlow(deltas)) {
+      // Entry / progression: gated on real recent BUYING — not a price-drift /
+      // displacement / stale-refresh rank shift, and not a position climbing on
+      // price while it's actually being sold.
+      if (upCrossed.length && recentBuy(deltas)) {
         // Fresh start when: never tracked, was outside top-30, chain was reset
         // by a recent exit (prevMilestones empty), OR the prior chain has gone
         // stale (>1h) — so we show only the new movement instead of re-printing
@@ -543,7 +549,7 @@ export async function runNotifications(env, scheduledTime) {
       // by other positions rising (displacement) has no flow → not an exit.
       if (downCrossed.length) {
         const redeemed = isRedeemedExit(current.pos, true);
-        if (hasRecentFlow(deltas) || redeemed) {
+        if (recentSell(deltas) || redeemed) {
           // Exit chain shows downward threshold crossings, symmetric to entry.
           const exitMilestones = buildExitChain(prevRank, downCrossed);
           exitEvents.push({
@@ -596,10 +602,10 @@ export async function runNotifications(env, scheduledTime) {
         fullPos, // null when fully dropped out → falls back to change events
       );
 
-      // Gate: a real drop-out is backed by recent sell flow OR is a redemption.
-      // A position that merely fell out of the tracked window because others rose
-      // (no flow, not resolved) is displacement, not a "sold down" — skip it.
-      if (!redeemed && !hasRecentFlow(deltas)) continue;
+      // Gate: a real drop-out is backed by recent SELLING OR is a redemption.
+      // A drop driven by displacement or a price move (no net selling, not
+      // resolved) is not a "sold down" — skip it.
+      if (!redeemed && !recentSell(deltas)) continue;
 
       const exitMilestones = buildExitChain(prevRank, downCrossed);
 
