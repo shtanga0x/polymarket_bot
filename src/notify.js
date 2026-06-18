@@ -505,16 +505,29 @@ export async function runNotifications(env, scheduledTime) {
         ? computeWindowDeltas(changes, current.pos.conditionId, current.outcomeIndex, current.pos.totalExposure, current.pos)
         : null;
 
+      // Fresh start when: never tracked, was outside top-30, chain was reset
+      // by a recent exit (prevMilestones empty), OR the prior chain has gone
+      // stale (>1h) — so we show only the new movement instead of re-printing
+      // a path the user already saw.
+      const startsFresh = prevRank == null || prevRank > 30
+        || prevMilestones.length === 0 || chainStale;
+
+      // Best (deepest) rank this live chain has already reached. Rank is ordered
+      // by exposure, so a position can jitter across a threshold it already
+      // crossed (e.g. #14 ⇄ #16 around the #15 line) while still drawing real buy
+      // flow — that re-tripped upCrossed every time and grew the header into
+      // "#14 → #14 → #14". Require strictly-better progress to (re-)fire: an
+      // up-cross only counts when the position reaches a rank below the chain's
+      // current best. Pure oscillation is carried forward silently below.
+      const bestInChain = startsFresh
+        ? Infinity
+        : Math.min(...prevMilestones.filter(Number.isFinite));
+      const madeProgress = startsFresh || current.rank < bestInChain;
+
       // Entry / progression: gated on real recent BUYING — not a price-drift /
       // displacement / stale-refresh rank shift, and not a position climbing on
-      // price while it's actually being sold.
-      if (upCrossed.length && recentBuy(deltas)) {
-        // Fresh start when: never tracked, was outside top-30, chain was reset
-        // by a recent exit (prevMilestones empty), OR the prior chain has gone
-        // stale (>1h) — so we show only the new movement instead of re-printing
-        // a path the user already saw.
-        const startsFresh = prevRank == null || prevRank > 30
-          || prevMilestones.length === 0 || chainStale;
+      // price while it's actually being sold — and only on genuine new progress.
+      if (upCrossed.length && recentBuy(deltas) && madeProgress) {
         let milestones = startsFresh
           ? [prevRank /* may be null → renders as "NEW" */, current.rank]
           : [...prevMilestones, current.rank];
