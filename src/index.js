@@ -219,7 +219,7 @@ async function handleCallback(update, env) {
     const topLevel = parseInt(data.slice(4));
     // Activation assigns the user's visible fingerprint symbol (in D1); mirror it
     // into the R2 profile so the notification hot path needs no D1 read.
-    const { symbol } = await recordActivate(env, chatId, lang).catch(() => ({}));
+    const { symbol } = await recordActivate(env, chatId, lang, user.portfolio).catch(() => ({}));
     await saveUser(env, chatId, { ...user, topLevel, active: true, state: 'active', ...(symbol ? { symbol } : {}) });
     await addToIndex(env, chatId);
     const label = portfolioLabel(user.portfolio ?? 'both', lang);
@@ -263,6 +263,26 @@ export default {
       ]);
       const info = await getWebhookInfo(env.BOT_TOKEN);
       return new Response(JSON.stringify(info), { headers: { 'content-type': 'application/json' } });
+    }
+    // One-time backfill: copy each existing subscriber's portfolio choice
+    // (core|watch|both — historically only in the R2 profile) into the shared DB
+    // so the control panel can segment them. Guarded by GATE_SECRET; idempotent.
+    if (req.method === 'GET' && url.pathname === '/backfill-portfolio') {
+      if (url.searchParams.get('secret') !== env.GATE_SECRET) return new Response('nope', { status: 403 });
+      const ids = await getUserIndex(env);
+      let updated = 0;
+      const seen = {};
+      for (const id of ids) {
+        const u = await getUser(env, id);
+        if (!u?.portfolio) continue;
+        const r = await env.DB.prepare(
+          `UPDATE users SET portfolio = ? WHERE bot = 'polymarket' AND chat_id = ?`
+        ).bind(u.portfolio, id).run();
+        if (r.meta.changes > 0) updated++;
+        seen[u.portfolio] = (seen[u.portfolio] ?? 0) + 1;
+      }
+      return new Response(JSON.stringify({ scanned: ids.length, updated, byPortfolio: seen }),
+        { headers: { 'content-type': 'application/json' } });
     }
     if (req.method !== 'POST') return new Response('OK');
     try {

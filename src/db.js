@@ -51,8 +51,10 @@ export async function recordSubCheck(env, chatId, from, ok) {
 }
 
 /** Mark active and ensure a visible fingerprint symbol is assigned (once).
- *  Returns the symbol so the caller can mirror it into the R2 profile. */
-export async function recordActivate(env, chatId, lang) {
+ *  `portfolio` ('core' | 'watch' | 'both') is mirrored into the shared DB so the
+ *  control panel can segment subscribers — it only ever lived in the R2 profile
+ *  before. Returns the symbol so the caller can mirror it into the R2 profile. */
+export async function recordActivate(env, chatId, lang, portfolio) {
   const row = await env.DB.prepare(
     `SELECT symbol, symbol_idx FROM users WHERE bot = ? AND chat_id = ?`
   ).bind(BOT, chatId).first();
@@ -68,10 +70,10 @@ export async function recordActivate(env, chatId, lang) {
     }
   }
   await env.DB.prepare(
-    `UPDATE users SET active = 1, lang = ?, symbol = ?, symbol_idx = ?, last_seen = ?
+    `UPDATE users SET active = 1, lang = ?, symbol = ?, symbol_idx = ?, portfolio = ?, last_seen = ?
      WHERE bot = ? AND chat_id = ?`
-  ).bind(lang ?? null, symbol, idx, now(), BOT, chatId).run();
-  await logEvent(env, chatId, null, 'activate');
+  ).bind(lang ?? null, symbol, idx, portfolio ?? null, now(), BOT, chatId).run();
+  await logEvent(env, chatId, null, 'activate', portfolio ? { portfolio } : {});
   return { symbol, idx };
 }
 
