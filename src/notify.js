@@ -24,6 +24,30 @@ const MAX_MILESTONES  = 10; // cap chain length so a long-lived position can't g
 // passed path when it later ticks to #3 — after this window the chain resets
 // so the next message shows only the fresh movement (e.g. "#4 → #3").
 const MILESTONE_TTL_MS = 60 * 60 * 1000; // 1 hour
+// Roster-change circuit breaker. Each market's exposure/traderCount in the feed
+// is the SUM over the included traders, so adding/removing even a couple of
+// active traders (e.g. a tier reshuffle on the dashboard) re-weights every
+// market they touch — shifting many top-30 ranks and bumping trader counts in a
+// single regenerated feed. That trips (rank-cross + activity) on dozens of
+// positions at once, which is a data artifact, not dozens of real moves. When a
+// single tick would fire more than this many events on one source, skip the
+// send and just re-baseline the snapshot (already saved) so the next tick
+// compares against the post-shift roster and only genuine changes notify.
+// Same spirit as the isFirstRun guard, extended to wholesale churn.
+const MAX_EVENTS_PER_TICK = 12;
+// A position's rank moves for two reasons: a real trade (logged in the trade-flow
+// feed → windowChanges) OR bookkeeping — price drift, another position rising/
+// falling, or the holdings aggregate lagging the trade log and only now counting
+// an hours-old trade. Only the first deserves a notification. So we gate on
+// RECENT trade flow (last-hour net USD), NOT on a shares/traderCount delta or a
+// drop-out: those are driven by the lagging holdings aggregate and fire for pure
+// displacement and stale-refresh artifacts — every false alert observed had
+// 1h == $0. Redemptions (resolved markets) are legitimately flow-less, so the
+// exit path exempts them separately.
+const MIN_RECENT_FLOW_USD = 1; // |last-hour net flow| below this ≈ no real trade
+function hasRecentFlow(deltas) {
+  return Math.abs(deltas?.h1?.usd ?? 0) >= MIN_RECENT_FLOW_USD;
+}
 
 const SOURCES = [
   {
@@ -437,20 +461,12 @@ export async function runNotifications(env, scheduledTime) {
     for (const [key, current] of currentByKey) {
       const prev = prevByKey.get(key);
       const prevRank        = prev?.rank ?? null;       // null = wasn't in prev top-200
-      const prevSize        = prev?.size ?? null;
-      const prevTraderCount = prev?.traderCount ?? null;
       const prevMilestones  = prev?.milestones ?? [];
       const prevMilestonesTs = prev?.milestonesTs ?? null;
       // Stale once the chain hasn't advanced within the TTL (or predates this
       // field, e.g. snapshots written before TTL tracking existed).
       const chainStale = prevMilestonesTs == null
         || (nowMs - prevMilestonesTs) > MILESTONE_TTL_MS;
-
-      // Activity gate: size or traderCount must have changed.
-      // For brand-new positions in snapshot, treat as "active" (real entry).
-      const sizeChanged = prev != null
-        ? (Math.abs(current.size - prevSize) > 0.001 || current.traderCount !== prevTraderCount)
-        : true;
 
       // Threshold transitions
       const upCrossed = THRESHOLDS.filter(T =>
@@ -460,8 +476,16 @@ export async function runNotifications(env, scheduledTime) {
         prevRank != null && prevRank <= T && current.rank > T
       );
 
-      // Entry / progression: any up-crosses (gated by activity)
-      if (upCrossed.length && sizeChanged) {
+      // Recent trade flow for this position — the activity gate (see
+      // hasRecentFlow) and the message body share it. Computed once, only when a
+      // threshold actually crossed.
+      const deltas = (upCrossed.length || downCrossed.length)
+        ? computeWindowDeltas(changes, current.pos.conditionId, current.outcomeIndex, current.pos.totalExposure, current.pos)
+        : null;
+
+      // Entry / progression: gated on a real recent trade — not a price-drift /
+      // displacement / stale-refresh rank shift.
+      if (upCrossed.length && hasRecentFlow(deltas)) {
         // Fresh start when: never tracked, was outside top-30, chain was reset
         // by a recent exit (prevMilestones empty), OR the prior chain has gone
         // stale (>1h) — so we show only the new movement instead of re-printing
@@ -475,8 +499,6 @@ export async function runNotifications(env, scheduledTime) {
         if (milestones.length > MAX_MILESTONES) {
           milestones = [milestones[0], ...milestones.slice(-(MAX_MILESTONES - 1))];
         }
-        // Entry/progression messages now carry the same 1h/24h/1w flow lines.
-        const deltas = computeWindowDeltas(changes, current.pos.conditionId, current.outcomeIndex, current.pos.totalExposure, current.pos);
         entryEvents.push({ key, current, prev, milestones, upCrossed, deltas });
         // Stamp milestones (+ advance timestamp) on the current snapshot entry
         current.nextMilestones = milestones;
@@ -494,20 +516,23 @@ export async function runNotifications(env, scheduledTime) {
         }
       }
 
-      // Exit (partial drop within top-200): activity required
-      if (downCrossed.length && sizeChanged) {
-        const deltas = computeWindowDeltas(changes, current.pos.conditionId, current.outcomeIndex, current.pos.totalExposure, current.pos);
+      // Exit (partial drop within top-200): a real recent sell-down, OR a
+      // redemption (resolved market — legitimately flow-less). A drop driven only
+      // by other positions rising (displacement) has no flow → not an exit.
+      if (downCrossed.length) {
         const redeemed = isRedeemedExit(current.pos, true);
-        // Exit chain shows downward threshold crossings, symmetric to entry.
-        const exitMilestones = buildExitChain(prevRank, downCrossed);
-        exitEvents.push({
-          key, current, prev,
-          milestones: exitMilestones,
-          downCrossed, deltas, redeemed,
-        });
-        // After exit, reset milestones for re-entry
-        current.nextMilestones = [];
-        current.nextMilestonesTs = null;
+        if (hasRecentFlow(deltas) || redeemed) {
+          // Exit chain shows downward threshold crossings, symmetric to entry.
+          const exitMilestones = buildExitChain(prevRank, downCrossed);
+          exitEvents.push({
+            key, current, prev,
+            milestones: exitMilestones,
+            downCrossed, deltas, redeemed,
+          });
+          // After exit, reset milestones for re-entry
+          current.nextMilestones = [];
+          current.nextMilestonesTs = null;
+        }
       }
     }
 
@@ -523,24 +548,16 @@ export async function runNotifications(env, scheduledTime) {
       const downCrossed = THRESHOLDS.filter(T => prevRank <= T);
       if (downCrossed.length === 0) continue; // wasn't in any threshold; nothing to fire
 
-      // Activity gate. If position vanished from portfolio entirely → assume redemption / full sell (activity).
-      // If still present but past top-200 — compare size to prev.size.
-      let sizeChanged;
       let displayPos;
       let redeemed;
       if (fullPos) {
-        const curSize = aggregateSize(fullPos);
-        const curTC   = fullPos.traderCount ?? (fullPos.traders?.length ?? 0);
-        sizeChanged = Math.abs(curSize - (prev.size ?? 0)) > 0.001 || curTC !== (prev.traderCount ?? 0);
         displayPos = fullPos;
         redeemed = isRedeemedExit(fullPos, true);
       } else {
-        // Disappeared → infer redemption if we know endDate, else treat as fully sold.
-        sizeChanged = true; // disappearance is itself activity
+        // Disappeared → infer redemption if we know endDate, else a full sell.
         displayPos = prev.lastPos || null;
         redeemed = isRedeemedExit(displayPos || prev, false);
       }
-      if (!sizeChanged) continue;
       if (!displayPos) continue; // can't render without position metadata
 
       // For disappeared positions, current exposure is effectively 0 (no remaining
@@ -553,6 +570,11 @@ export async function runNotifications(env, scheduledTime) {
         currentExposureForDelta,
         fullPos, // null when fully dropped out → falls back to change events
       );
+
+      // Gate: a real drop-out is backed by recent sell flow OR is a redemption.
+      // A position that merely fell out of the tracked window because others rose
+      // (no flow, not resolved) is displacement, not a "sold down" — skip it.
+      if (!redeemed && !hasRecentFlow(deltas)) continue;
 
       const exitMilestones = buildExitChain(prevRank, downCrossed);
 
@@ -604,6 +626,15 @@ export async function runNotifications(env, scheduledTime) {
     // 9. Suppress notifications on first run after fresh deploy
     if (isFirstRun) continue;
     if (entryEvents.length === 0 && exitEvents.length === 0) continue;
+
+    // 9b. Roster-change circuit breaker. Snapshot is already saved (step 8), so
+    // skipping the send here re-baselines silently — the next tick fires only on
+    // genuine post-shift movement instead of the whole reshuffle at once.
+    const eventCount = entryEvents.length + exitEvents.length;
+    if (eventCount > MAX_EVENTS_PER_TICK) {
+      console.warn(`[notify] ${source.key}: ${eventCount} events in one tick (> ${MAX_EVENTS_PER_TICK}) — likely a roster/feed change; re-baselining without notifying.`);
+      continue;
+    }
 
     // 10. Notify subscribers
     const userIds = await getSubscribers(env);
