@@ -54,5 +54,11 @@ export async function checkMembership(token, channelId, userId) {
     console.error('getChatMember failed (bot not group admin?):', res.description);
     return false;
   }
-  return ['member', 'administrator', 'creator'].includes(res.result?.status);
+  const m = res.result;
+  // A 'restricted' member is STILL in the group (is_member: true) — Telegram
+  // reports ordinary members as 'restricted' whenever the group's default
+  // permissions are restrictive. Treat them as members so they aren't falsely
+  // gated (matches the chat_member revocation 'stillInGroup' logic).
+  if (m?.status === 'restricted') return m.is_member === true;
+  return ['member', 'administrator', 'creator'].includes(m?.status);
 }

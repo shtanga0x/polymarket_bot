@@ -155,6 +155,11 @@ async function handleChatMember(update, env) {
 async function handleMessage(update, env) {
   const msg = update.message;
   if (!msg?.text) return;
+  // Onboarding/settings is a 1:1 DM flow. Ignore group/supergroup messages —
+  // otherwise a user typing /start inside the gated group makes the bot reply
+  // INTO the group (spamming the inner circle) and key the flow on the group's
+  // own id instead of the user's. Group joins/leaves arrive via chat_member.
+  if (msg.chat?.type !== 'private') return;
   const chatId = msg.chat.id;
   const text   = msg.text;
 
@@ -170,6 +175,11 @@ async function handleMessage(update, env) {
 async function handleCallback(update, env) {
   const { BOT_TOKEN: token, CHANNEL_ID } = env;
   const cb     = update.callback_query;
+  // Drive the DM flow only in private chats. A button pressed on a bot message
+  // that landed in the group would otherwise key every action (membership check,
+  // sub-check logging, replies) on the group id — producing false "failed group
+  // check" alerts and posting the onboarding flow into the inner-circle group.
+  if (cb.message?.chat?.type !== 'private') return answerCallback(token, cb.id);
   const chatId = cb.message.chat.id;
   const msgId  = cb.message.message_id;
   const data   = cb.data;
