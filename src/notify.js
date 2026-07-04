@@ -280,11 +280,19 @@ function renderPriceLine(pos, sold = false) {
 // DISJOINT interval (not cumulative): last hour, the 1h→24h slice, the 24h→1w
 // slice. % is the change over that slice vs its starting value.
 function renderDeltaLines(deltas) {
-  return [
-    `📊 1h:     ${fmtUSDSigned(deltas.h1.usd)} (${fmtPct(deltas.h1.pct)})`,
-    `📊 1h–24h: ${fmtUSDSigned(deltas.d1.usd)} (${fmtPct(deltas.d1.pct)})`,
-    `📊 24h–1w: ${fmtUSDSigned(deltas.w1.usd)} (${fmtPct(deltas.w1.pct)})`,
-  ];
+  const rows = [
+    ['1h:',     deltas.h1],
+    ['1h–24h:', deltas.d1],
+    ['24h–1w:', deltas.w1],
+  ].map(([label, d]) => ({ label, abs: fmtUSDSigned(d.usd), pct: `(${fmtPct(d.pct)})` }));
+  // Three columns — timeframe | absolute change | relative % — wrapped in <code>
+  // (monospace) so they line up: Telegram's normal proportional font collapses
+  // any space padding. Each column is padded to its widest cell; the identical
+  // "📊 " prefix keeps every line's <code> block left-aligned.
+  const labelW = Math.max(...rows.map(r => r.label.length));
+  const absW   = Math.max(...rows.map(r => r.abs.length));
+  return rows.map(r =>
+    `📊 <code>${r.label.padEnd(labelW)} ${r.abs.padEnd(absW)} ${r.pct}</code>`);
 }
 
 function exposureLine(pos, prevTraderCount, totalPortfolioExposure) {
@@ -355,9 +363,14 @@ async function saveState(env, key, snapshotEntries, lastProcessed) {
 
 // ─── HTTP helpers ──────────────────────────────────────────────────────────
 
-async function fetchJSON(url) {
+async function fetchJSON(url, serviceKey) {
   try {
-    const res = await fetch(url + '?t=' + Date.now());
+    // The data host is gated; present the shared service key so the bot (which has
+    // no member cookie) is let through. Only ever sent to data.shtanga.xyz — never
+    // leak the secret to the Polymarket APIs this helper also fetches.
+    const headers = serviceKey && url.includes('data.shtanga.xyz')
+      ? { 'X-Shtanga-Key': serviceKey } : undefined;
+    const res = await fetch(url + '?t=' + Date.now(), headers ? { headers } : undefined);
     if (!res.ok) return null;
     return res.json();
   } catch { return null; }
@@ -434,7 +447,7 @@ export async function runNotifications(env, scheduledTime) {
     // 1+2. Single slim feed (~100KB) — the pipeline publishes bot_feed.json
     // with exactly the fields we need. Parsing the full aggregated_portfolio
     // (multi-MB) blew the Workers CPU limit and stalled notifications.
-    const feed = await fetchJSON(source.feedUrl);
+    const feed = await fetchJSON(source.feedUrl, env.DATA_SERVICE_KEY);
     if (!feed?.last_updated) continue;
 
     const state = await getState(env, source.key);

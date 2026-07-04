@@ -25,3 +25,12 @@ database_id = "961c61d8-6076-44cc-a613-3929e5110832"
 # Set secrets after deploy:
 #   npx wrangler secret put BOT_TOKEN
 #   npx wrangler secret put CHANNEL_ID   ← numeric ID of the closed group, e.g. -1003468238602
+
+# ─── Workers Paid hardening (2026-07-03) ──────────────────────────────────────
+# Logs go to Workers Logs; any exception/CPU-blowout pages the owner via the
+# shtanga-tail-alerts Tail Worker.
+[observability]
+enabled = true
+
+[[tail_consumers]]
+service = "shtanga-tail-alerts"
